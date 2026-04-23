@@ -1,0 +1,33 @@
+{
+  "_comment_about_this_file": "Example snippet showing how to wire the statusline and hooks into ~/.claude/settings.json. Merge these sections into your existing settings.json — don't blindly overwrite. The install.sh script does this merge safely.",
+
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline.sh",
+    "padding": 2,
+    "refreshInterval": 10
+  },
+
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/auto-budget-check.js"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/weekly-maintenance.js"
+          }
+        ]
+      }
+    ]
+  }
+}
