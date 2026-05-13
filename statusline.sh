@@ -286,7 +286,26 @@ if [ -n "$cwd" ]; then
       owner="${owner##*:}"
     fi
 
-    if [ -n "$owner" ]; then
+    # Only display @owner if it matches one of the user's locally-authenticated
+    # gh accounts. Without this check, anyone who clones someone else's repo
+    # would see that owner's handle in their statusline.
+    is_my_account=0
+    if [ -n "$owner" ] && command -v gh >/dev/null 2>&1; then
+      gh_accounts_cache="$HOME/.claude/.gh-accounts-cache"
+      cache_age=99999
+      if [ -f "$gh_accounts_cache" ]; then
+        cache_mtime=$(stat -f %m "$gh_accounts_cache" 2>/dev/null || stat -c %Y "$gh_accounts_cache" 2>/dev/null || echo 0)
+        cache_age=$(( $(date +%s) - cache_mtime ))
+      fi
+      if [ ! -f "$gh_accounts_cache" ] || [ "$cache_age" -gt 3600 ]; then
+        gh auth status 2>&1 | sed -nE 's/.*Logged in to github\.com account ([^ ]+).*/\1/p' > "$gh_accounts_cache" 2>/dev/null || true
+      fi
+      if [ -f "$gh_accounts_cache" ] && grep -Fxq "$owner" "$gh_accounts_cache" 2>/dev/null; then
+        is_my_account=1
+      fi
+    fi
+
+    if [ -n "$owner" ] && [ "$is_my_account" = "1" ]; then
       # Color by sync state:
       #   green  = clean + synced     yellow = dirty (uncommitted)
       #   orange = ahead (push)       cyan   = behind (pull)
