@@ -44,9 +44,10 @@ cd LLM-orchestrator-status
 ```
 
 The installer:
-1. Backs up any existing `~/.claude/statusline.sh`, `~/.claude/scripts/`, `~/.claude/commands/`, and `~/.claude/hooks/` targets to `~/.claude/backups/pre-install-<ts>/`
-2. Symlinks this repo's files into `~/.claude/` (so `git pull` upgrades everything)
-3. Prints the settings.json snippet you need to merge manually
+1. Prompts once per optional component — accept the default (Y) to match the author's setup, or decline to skip. Pass `--all` to skip prompts and install everything, or `--minimal` to install only the statusline.
+2. Backs up any existing `~/.claude/statusline.sh`, `~/.claude/scripts/`, `~/.claude/commands/`, and `~/.claude/hooks/` targets to `~/.claude/backups/pre-install-<ts>/`
+3. Symlinks this repo's files into `~/.claude/` (so `git pull` upgrades everything)
+4. Prints the settings.json snippet for only the components you installed
 
 **Manual install** — if you'd rather see what's going on:
 
@@ -67,8 +68,9 @@ Once installed and the settings.json snippet is merged, these are available via 
 
 | Command | When to use |
 |---|---|
-| `/dispatch-codex <task>` | Force Codex for mechanical code generation — new API endpoint mirroring an existing file, CRUD scaffold, repetitive component, etc. |
-| `/dispatch-gemini <task>` | Force Gemini for long-context work (>150k input tokens), multi-modal tasks (images/PDFs/video), or parallel-batch fan-out |
+| `/dispatch <model_id> <task>` | Dispatch to any model in the registry — e.g. `/dispatch codex <task>`, `/dispatch qwen <task>` |
+| `/dispatch-codex <task>` | Shortcut for `/dispatch codex` — Codex for mechanical code gen, CRUD scaffolds, pattern-following |
+| `/dispatch-gemini <task>` | Shortcut for `/dispatch gemini` — Gemini for long-context (>150k tokens), multi-modal, parallel-batch |
 | `/budget-check <plan>` | Pre-flight: does this plan fit in the remaining 5h window? Returns ✅ / ⚠️ / ❌ with concrete options |
 | `/execute-at-reset <plan>` | Schedule a plan to auto-execute ~1 min after the next 5h reset (via Claude Code's `CronCreate`) |
 
@@ -78,6 +80,19 @@ Once installed and the settings.json snippet is merged, these are available via 
 |---|---|---|
 | `auto-budget-check.js` | `UserPromptSubmit` | Scans each prompt for execution-intent keywords (execute, implement, deploy, refactor…). If matched AND 5h usage ≥40%, injects a `[auto-budget]` advisory into the context so Claude sees it before starting. Escalates to 🚨 at ≥80%. |
 | `weekly-maintenance.js` | `SessionStart` | Once per 7 days, rotates dispatch logs older than 30 days and refreshes the Gemini model cache. Runs in background (`child.unref()`) so session startup is never blocked. |
+| `ruflo-model-enforcer.js` | `PreToolUse` (Agent) | Optional. See below. |
+
+### RuFlo (model routing)
+
+`hooks/ruflo-model-enforcer.js` fires on every `Agent` tool call and rewrites the `model` parameter to the cheapest tier that fits the task. It uses keyword heuristics — no external CLI, no network calls, no LLM inference. The whole thing is ~120 lines of Node.js with no dependencies.
+
+**How it works:** the hook scores the agent's `description` field against three keyword lists (haiku / sonnet / opus). Longer descriptions get a small complexity boost toward opus. When the winning tier beats a 0.5 confidence threshold, the hook either confirms the chosen model (AGREE) or swaps it (REWRITE). Below threshold it passes through without touching anything.
+
+**Writes:** `~/.claude/hooks/ruflo-last-route.txt` — a one-line record of the last routing decision, consumed by the statusline. `~/.claude/hooks/ruflo-enforcer.log` — append-only log of every firing.
+
+**Tuning:** the keyword lists are at the top of `hooks/ruflo-model-enforcer.js` in a `KEYWORDS` object. Add or remove terms to match your own usage patterns. The length thresholds (200 / 400 chars) are also in the same block.
+
+The installer prompts before installing this hook. To add it later, copy or symlink `hooks/ruflo-model-enforcer.js` to `~/.claude/hooks/` and add the `PreToolUse` block from `examples/settings.json`.
 
 ## Statusline
 
@@ -131,6 +146,66 @@ To change the statusline colors, the gradient is defined in `pct_color()` near t
  └─────────────────────────────────────────┘
 ```
 
+## Model registry
+
+`~/.claude/orchestrator-models.json` is the single source of truth for the statusline and `/dispatch`. The install wizard writes it; you can also edit it by hand.
+
+### Schema
+
+```json
+{
+  "version": 1,
+  "models": [
+    {
+      "id":             "qwen",
+      "display_name":   "qwen 2.5",
+      "model_label":    "72b-instruct",
+      "command":        "qwen",
+      "args_template":  "run {prompt_file}",
+      "rate_limit_5h":  200,
+      "color":          "#e05c2a",
+      "last_file":      "~/.claude/qwen-last.json"
+    }
+  ]
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | yes | Unique key. Used for log file naming and `/dispatch <id>`. |
+| `command` | yes | The CLI binary name (must be on `$PATH`). |
+| `args_template` | yes | Command arguments. `{prompt_file}` is replaced with the spec file path. `{output_file}` is available for CLIs that write output to a file rather than stdout. |
+| `last_file` | yes | Path where the dispatcher writes the last-run JSON (`~` is expanded). Statusline reads this. |
+| `display_name` | no | Label shown in the statusline. Defaults to `id`. |
+| `model_label` | no | Model version shown next to the display name. |
+| `rate_limit_5h` | no | Dispatch cap per 5-hour rolling window — used for the usage bar. Omit if you don't want a bar. |
+| `color` | no | `#rrggbb` hex color for the statusline row label. Defaults to white. |
+
+### Adding a model without re-running install
+
+1. Open `~/.claude/orchestrator-models.json`.
+2. Append an entry to the `models` array following the schema above.
+3. Restart Claude Code (or wait for the next statusline tick).
+
+No hook changes or script installs needed — the generic dispatcher `~/.claude/scripts/llm-dispatch.sh` handles all models in the registry.
+
+### Example: `llm` (Simon Willison's LLM CLI)
+
+```json
+{
+  "id":            "llm",
+  "display_name":  "llm",
+  "model_label":   "claude-3-haiku",
+  "command":       "llm",
+  "args_template": "prompt -m claude-3-haiku < {prompt_file}",
+  "rate_limit_5h": 500,
+  "color":         "#3db8f5",
+  "last_file":     "~/.claude/llm-last.json"
+}
+```
+
+Then dispatch with: `/dispatch llm <task description>`
+
 ## When to use what
 
 Routing heuristics the author has settled on after ~6 weeks of daily use:
@@ -138,10 +213,11 @@ Routing heuristics the author has settled on after ~6 weeks of daily use:
 | Task profile | Executor |
 |---|---|
 | Judgment, debugging, architecture, security, ambiguous scope | **Claude** (don't delegate) |
-| Mechanical code, ~60+ lines, mirroring an existing file's style | **Codex** (default) |
-| Input > ~150k tokens (summarize log, analyze whole repo, big PDF) | **Gemini** |
-| Multi-modal input (images, screenshots, PDFs, video) | **Gemini** (Codex CLI is text-only) |
-| 5+ similar mechanical sub-tasks in parallel | **Gemini** (Pro tier has more headroom than Codex Plus) |
+| Mechanical code, ~60+ lines, mirroring an existing file's style | `/dispatch codex` (default) |
+| Input > ~150k tokens (summarize log, analyze whole repo, big PDF) | `/dispatch gemini` |
+| Multi-modal input (images, screenshots, PDFs, video) | `/dispatch gemini` (Codex CLI is text-only) |
+| 5+ similar mechanical sub-tasks in parallel | `/dispatch gemini` (Pro tier has more headroom than Codex Plus) |
+| Any other registered CLI model | `/dispatch <model_id>` |
 | Small edit (<30 lines) | **Claude direct** (dispatch overhead exceeds gain) |
 
 Codex and Gemini have rough quality parity on code generation. The bottleneck is usually spec precision and your smoke-test discipline, not the model.

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Claude Code status line — shows Claude context/rate-limits, Codex, and
-# Gemini dispatch activity on up to three rows. Writes a session-state cache
-# to ~/.claude/.session-state.json that the /budget-check and /execute-at-reset
-# slash commands and the auto-budget-check hook read.
+# Gemini dispatch activity on up to three rows. When ~/.claude/orchestrator-models.json
+# is present (Layer 2), additional model rows are rendered dynamically from that
+# registry (up to 5 total, skipping uninstalled CLIs). Falls back to the
+# original hardcoded Codex + Gemini rows when the registry does not exist.
+# Writes a session-state cache to ~/.claude/.session-state.json that the
+# /budget-check and /execute-at-reset slash commands and the auto-budget-check
+# hook read.
 
 input=$(cat)
 
@@ -359,260 +363,361 @@ out="${out}${SEP}${cost_part}"
 out="${out}${SEP}${elapsed_part}"
 [ -n "$loc_part" ]   && out="${out}${SEP}${loc_part}"
 
-# ── Codex dispatch line (second row) ─────────────────────────────────────────
-codex_line=""
-codex_auth_cache="$HOME/.claude/codex-auth-cache.txt"
-codex_last_json="$HOME/.claude/codex-last.json"
-codex_auth_src="$HOME/.codex/auth.json"
-codex_refresh="$HOME/.claude/scripts/codex-refresh-auth-cache.sh"
+# ── Dispatch rows (rows 2–N) ──────────────────────────────────────────────────
+#
+# Two rendering paths:
+#
+#   REGISTRY PATH  — ~/.claude/orchestrator-models.json exists.
+#                    Iterate models[], skip CLIs not on PATH, cap at 5 rows,
+#                    render a lean row per model using the registry's color,
+#                    display_name, model_label, rate_limit_5h, and last_file.
+#
+#   FALLBACK PATH  — registry absent. Render the original hardcoded Codex +
+#                    Gemini rows so existing installs keep working with no
+#                    config migration required.
+#
+# The two paths are mutually exclusive. Registry wins when the file exists.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Lazy refresh: regenerate cache when auth.json is newer or cache missing.
-if [ -f "$codex_auth_src" ] && [ -x "$codex_refresh" ]; then
-  if [ ! -f "$codex_auth_cache" ] || [ "$codex_auth_src" -nt "$codex_auth_cache" ]; then
-    "$codex_refresh" >/dev/null 2>&1 || true
+REGISTRY="$HOME/.claude/orchestrator-models.json"
+
+if [ -f "$REGISTRY" ] && jq empty "$REGISTRY" 2>/dev/null; then
+
+  # ── REGISTRY PATH ────────────────────────────────────────────────────────
+  # Read all model IDs into a newline-separated list (Bash 3.2 compat — no
+  # associative arrays; query each field individually per model index).
+  model_ids="$(jq -r '.models[].id' "$REGISTRY" 2>/dev/null)"
+  row_count=0
+  now_sec=$(date -u +%s)
+
+  while IFS= read -r mid; do
+    [ -z "$mid" ] && continue
+    [ "$row_count" -ge 5 ] && break
+
+    # Per-model fields
+    m_command="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .command' "$REGISTRY" 2>/dev/null)"
+    m_display="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .display_name // .id' "$REGISTRY" 2>/dev/null)"
+    m_label="$(jq -r --arg id "$mid"  '.models[] | select(.id==$id) | .model_label // ""' "$REGISTRY" 2>/dev/null)"
+    m_cap="$(jq -r --arg id "$mid"    '.models[] | select(.id==$id) | .rate_limit_5h // ""' "$REGISTRY" 2>/dev/null)"
+    m_color_hex="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .color // ""' "$REGISTRY" 2>/dev/null)"
+    m_last_raw="$(jq -r --arg id "$mid"  '.models[] | select(.id==$id) | .last_file' "$REGISTRY" 2>/dev/null)"
+
+    # Skip if CLI not on PATH
+    command -v "$m_command" >/dev/null 2>&1 || continue
+
+    # Expand ~ in last_file path
+    m_last="${m_last_raw/#\~/$HOME}"
+
+    # Build ANSI color from hex (#rrggbb) or fall back to white
+    m_ansi="${WHITE}"
+    if [ -n "$m_color_hex" ] && [ "$m_color_hex" != "null" ]; then
+      hex="${m_color_hex#\#}"
+      if [ "${#hex}" -eq 6 ]; then
+        r_val=$((16#${hex:0:2}))
+        g_val=$((16#${hex:2:2}))
+        b_val=$((16#${hex:4:2}))
+        m_ansi="\033[38;2;${r_val};${g_val};${b_val}m"
+      fi
+    fi
+
+    # Label: display_name + optional model_label
+    m_part="${m_ansi}${BOLD}${m_display}${RESET}"
+    if [ -n "$m_label" ] && [ "$m_label" != "null" ]; then
+      m_part="${m_part} ${DIM}·${RESET} ${DIM}${m_label}${RESET}"
+    fi
+
+    # 5h dispatch bar — log file prefix is llm-dispatch-<id>- for generic,
+    # or <id>- for the legacy codex/gemini scripts. Count both.
+    dispatches_5h=0
+    cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
+    if [ -n "$cutoff_5h" ] && [ -d "$HOME/.claude/logs" ]; then
+      for f in "$HOME/.claude/logs/${mid}"-*.log \
+               "$HOME/.claude/logs/llm-dispatch-${mid}"-*.log; do
+        [ -f "$f" ] || continue
+        fm=$(stat -f "%m" "$f" 2>/dev/null)
+        [ -n "$fm" ] && [ "$fm" -ge "$cutoff_5h" ] && dispatches_5h=$((dispatches_5h+1))
+      done
+    fi
+
+    if [ -n "$m_cap" ] && [ "$m_cap" != "null" ] && [ "$m_cap" -gt 0 ] 2>/dev/null; then
+      d_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$m_cap)*100 + 0.5}")
+      [ "$d_pct" -gt 100 ] && d_pct=100
+      d_bar=$(make_bar "$d_pct" 6)
+      d_color=$(pct_color "$d_pct")
+      m_part="${m_part}${SEP}${d_bar} ${d_color}${dispatches_5h}${RESET}${DIM}/~${m_cap} (5h)${RESET}"
+    else
+      m_part="${m_part}${SEP}${DIM}${dispatches_5h} dispatches (5h)${RESET}"
+    fi
+
+    # Last dispatch info from last_file
+    if [ -f "$m_last" ]; then
+      m_ts="$(jq -r '.timestamp // empty' "$m_last" 2>/dev/null)"
+      m_elapsed="$(jq -r '.elapsed_s // 0' "$m_last" 2>/dev/null)"
+      m_status="$(jq -r '.status // "unknown"' "$m_last" 2>/dev/null)"
+      m_task="$(jq -r '.task_name // empty' "$m_last" 2>/dev/null)"
+
+      if [ -n "$m_ts" ]; then
+        m_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$m_ts" +%s 2>/dev/null)
+        if [ -n "$m_ts_sec" ]; then
+          m_age_sec=$((now_sec - m_ts_sec))
+          if   [ "$m_age_sec" -lt 60 ];    then m_age_str="${m_age_sec}s ago"
+          elif [ "$m_age_sec" -lt 3600 ];  then m_age_str="$((m_age_sec / 60))m ago"
+          elif [ "$m_age_sec" -lt 86400 ]; then m_age_str="$((m_age_sec / 3600))h ago"
+          else m_age_str="$((m_age_sec / 86400))d ago"
+          fi
+          if [ "$m_age_sec" -lt 600 ]; then m_age_color="${CYAN}"; else m_age_color="${DIM}"; fi
+          m_status_color="${WHITE}"
+          [ "$m_status" = "failed" ] && m_status_color="${RED}"
+          m_task_str=""
+          [ -n "$m_task" ] && m_task_str="${WHITE}${m_task}${RESET}${DIM} · ${RESET}"
+          m_part="${m_part}${SEP}${DIM}last:${RESET} ${m_task_str}${m_age_color}${m_age_str}${RESET}${DIM} · ${m_elapsed}s${RESET}"
+        fi
+      fi
+    else
+      m_part="${m_part}${SEP}${DIM}no dispatches yet${RESET}"
+    fi
+
+    out="${out}\n${m_part}"
+    row_count=$((row_count + 1))
+  done <<EOF
+$model_ids
+EOF
+
+else
+
+  # ── FALLBACK PATH — original hardcoded Codex + Gemini rows ───────────────
+  # Preserved verbatim so installs without orchestrator-models.json are unaffected.
+
+  codex_line=""
+  codex_auth_cache="$HOME/.claude/codex-auth-cache.txt"
+  codex_last_json="$HOME/.claude/codex-last.json"
+  codex_auth_src="$HOME/.codex/auth.json"
+  codex_refresh="$HOME/.claude/scripts/codex-refresh-auth-cache.sh"
+
+  # Lazy refresh: regenerate cache when auth.json is newer or cache missing.
+  if [ -f "$codex_auth_src" ] && [ -x "$codex_refresh" ]; then
+    if [ ! -f "$codex_auth_cache" ] || [ "$codex_auth_src" -nt "$codex_auth_cache" ]; then
+      "$codex_refresh" >/dev/null 2>&1 || true
+    fi
   fi
-fi
 
-if [ -f "$codex_auth_cache" ]; then
-  codex_email=""; codex_plan=""; codex_org=""
-  IFS='|' read -r codex_email codex_plan codex_org < "$codex_auth_cache" || true
+  if [ -f "$codex_auth_cache" ]; then
+    codex_email=""; codex_plan=""; codex_org=""
+    IFS='|' read -r codex_email codex_plan codex_org < "$codex_auth_cache" || true
 
-  case "$codex_email" in
-    ""|unknown|missing|error)
-      # Only surface identity when something is wrong
-      codex_part="${CODEX_GREEN}${BOLD}codex${RESET}${SEP}${RED}✗ not logged in${RESET}"
-      ;;
-    *)
-      # Authed state — codex + plan rendered as single bold teal blob.
-      codex_part="${CODEX_GREEN}${BOLD}codex${RESET}"
-      if [ -n "$codex_plan" ] && [ "$codex_plan" != "unknown" ] && [ "$codex_plan" != "none" ]; then
-        codex_part="${CODEX_GREEN}${BOLD}codex ${codex_plan}${RESET}"
-      fi
+    case "$codex_email" in
+      ""|unknown|missing|error)
+        codex_part="${CODEX_GREEN}${BOLD}codex${RESET}${SEP}${RED}✗ not logged in${RESET}"
+        ;;
+      *)
+        codex_part="${CODEX_GREEN}${BOLD}codex${RESET}"
+        if [ -n "$codex_plan" ] && [ "$codex_plan" != "unknown" ] && [ "$codex_plan" != "none" ]; then
+          codex_part="${CODEX_GREEN}${BOLD}codex ${codex_plan}${RESET}"
+        fi
 
-      # Append active model. Prefer the model recorded on the last dispatch
-      # (captures overrides); fall back to config.toml default.
-      codex_model=""
-      if [ -f "$codex_last_json" ]; then
-        codex_model=$(jq -r '.model // empty' "$codex_last_json" 2>/dev/null)
-      fi
-      if [ -z "$codex_model" ] || [ "$codex_model" = "unknown" ]; then
-        codex_model=$(grep -m1 -E '^model[[:space:]]*=' "$HOME/.codex/config.toml" 2>/dev/null | sed 's/.*= *"//; s/".*//')
-      fi
-      if [ -n "$codex_model" ]; then
-        # Color the model cyan when a dispatch ran in the last 10 min
-        # (activation indicator — same rule as age), dim otherwise.
-        codex_model_color="${DIM}"
+        codex_model=""
         if [ -f "$codex_last_json" ]; then
-          ct=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
-          if [ -n "$ct" ]; then
-            cts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ct" +%s 2>/dev/null)
-            if [ -n "$cts" ] && [ "$(( $(date -u +%s) - cts ))" -lt 600 ]; then
-              codex_model_color="${CYAN}"
+          codex_model=$(jq -r '.model // empty' "$codex_last_json" 2>/dev/null)
+        fi
+        if [ -z "$codex_model" ] || [ "$codex_model" = "unknown" ]; then
+          codex_model=$(grep -m1 -E '^model[[:space:]]*=' "$HOME/.codex/config.toml" 2>/dev/null | sed 's/.*= *"//; s/".*//')
+        fi
+        if [ -n "$codex_model" ]; then
+          codex_model_color="${DIM}"
+          if [ -f "$codex_last_json" ]; then
+            ct=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
+            if [ -n "$ct" ]; then
+              cts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ct" +%s 2>/dev/null)
+              if [ -n "$cts" ] && [ "$(( $(date -u +%s) - cts ))" -lt 600 ]; then
+                codex_model_color="${CYAN}"
+              fi
+            fi
+          fi
+          codex_part="${codex_part} ${DIM}·${RESET} ${codex_model_color}${codex_model}${RESET}"
+
+          if [ -f "$codex_last_json" ]; then
+            codex_reasoning=$(jq -r '.reasoning_effort // "none"' "$codex_last_json" 2>/dev/null)
+            if [ -n "$codex_reasoning" ] && [ "$codex_reasoning" != "none" ] && [ "$codex_reasoning" != "null" ]; then
+              codex_part="${codex_part} ${YELLOW}r:${codex_reasoning}${RESET}"
             fi
           fi
         fi
-        codex_part="${codex_part} ${DIM}·${RESET} ${codex_model_color}${codex_model}${RESET}"
+        ;;
+    esac
 
-        # Reasoning-effort indicator — only when elevated (skip "none" default).
-        # Colored yellow to signal "this run used extra compute."
-        if [ -f "$codex_last_json" ]; then
-          codex_reasoning=$(jq -r '.reasoning_effort // "none"' "$codex_last_json" 2>/dev/null)
-          if [ -n "$codex_reasoning" ] && [ "$codex_reasoning" != "none" ] && [ "$codex_reasoning" != "null" ]; then
-            codex_part="${codex_part} ${YELLOW}r:${codex_reasoning}${RESET}"
+    codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
+    dispatches_5h=0
+    total_toks_5h=0
+    if [ -d "$HOME/.claude/logs" ]; then
+      cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
+      if [ -n "$cutoff_5h" ]; then
+        for f in "$HOME"/.claude/logs/codex-*.log; do
+          [ -f "$f" ] || continue
+          m=$(stat -f "%m" "$f" 2>/dev/null)
+          if [ -n "$m" ] && [ "$m" -ge "$cutoff_5h" ]; then
+            dispatches_5h=$((dispatches_5h+1))
+            t=$(grep -oE 'tokens=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)
+            [ -n "$t" ] && total_toks_5h=$((total_toks_5h + t))
+          fi
+        done
+      fi
+    fi
+    dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
+    [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
+    dispatch_bar=$(make_bar "$dispatch_pct" 6)
+    dispatch_color=$(pct_color "$dispatch_pct")
+    if [ "$total_toks_5h" -ge 1000 ]; then
+      toks_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $total_toks_5h/1000}")
+    else
+      toks_5h_disp="$total_toks_5h"
+    fi
+    codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+
+    if [ -f "$codex_last_json" ]; then
+      codex_ts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
+      codex_tokens=$(jq -r '.tokens // 0' "$codex_last_json" 2>/dev/null)
+      codex_elapsed=$(jq -r '.elapsed_s // 0' "$codex_last_json" 2>/dev/null)
+      codex_status=$(jq -r '.status // "unknown"' "$codex_last_json" 2>/dev/null)
+      codex_task=$(jq -r '.task_name // empty' "$codex_last_json" 2>/dev/null)
+
+      if [ -n "$codex_ts" ]; then
+        codex_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$codex_ts" +%s 2>/dev/null)
+        if [ -n "$codex_ts_sec" ]; then
+          codex_now_sec=$(date -u +%s)
+          codex_age_sec=$((codex_now_sec - codex_ts_sec))
+          if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
+          elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
+          elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
+          else codex_age_str="$((codex_age_sec / 86400))d ago"
+          fi
+
+          if [ "$codex_age_sec" -lt 600 ]; then codex_age_color="${CYAN}"
+          else codex_age_color="${DIM}"
+          fi
+
+          if [ "$codex_tokens" -ge 1000 ]; then
+            codex_tok_disp=$(awk "BEGIN{printf \"%.1fk\", $codex_tokens/1000}")
+          else
+            codex_tok_disp="$codex_tokens"
+          fi
+
+          codex_tok_color="${WHITE}"
+          [ "$codex_status" = "failed" ] && codex_tok_color="${RED}"
+
+          codex_task_str=""
+          [ -n "$codex_task" ] && codex_task_str="${WHITE}${codex_task}${RESET}${DIM} · ${RESET}"
+
+          codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_task_str}${codex_tok_color}${codex_tok_disp}${RESET} ${DIM}toks · ${RESET}${codex_age_color}${codex_age_str}${RESET}${DIM} · ${codex_elapsed}s${RESET}"
+        fi
+      fi
+    else
+      codex_part="${codex_part}${SEP}${DIM}no dispatches yet${RESET}"
+    fi
+
+    codex_line="$codex_part"
+  fi
+
+  [ -n "$codex_line" ] && out="${out}\n${codex_line}"
+
+  # Gemini row
+  gemini_line=""
+  gemini_last_json="$HOME/.claude/gemini-last.json"
+  gemini_creds="$HOME/.gemini/oauth_creds.json"
+
+  if command -v gemini >/dev/null 2>&1 && [ -f "$gemini_creds" ]; then
+    gemini_part="${GEMINI_PURPLE}${BOLD}gemini pro${RESET}"
+
+    gemini_model_cache="$HOME/.claude/gemini-model-cache.txt"
+    if [ -f "$gemini_model_cache" ]; then
+      gemini_model=$(head -1 "$gemini_model_cache" | tr -d '[:space:]')
+      gemini_model_short="${gemini_model#gemini-}"
+      gemini_model_color="${DIM}"
+      if [ -f "$gemini_last_json" ]; then
+        gt=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
+        if [ -n "$gt" ]; then
+          gts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gt" +%s 2>/dev/null)
+          if [ -n "$gts" ] && [ "$(( $(date -u +%s) - gts ))" -lt 600 ]; then
+            gemini_model_color="${CYAN}"
           fi
         fi
       fi
-      ;;
-  esac
-
-  # Dispatches per rolling 5h window (ChatGPT Plus limits usage by messages,
-  # not tokens — Plus = 20–100/5h on GPT-5.4. Default cap=50 (midpoint);
-  # override via CODEX_DISPATCH_CAP_5H env var.
-  codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
-  dispatches_5h=0
-  total_toks_5h=0
-  if [ -d "$HOME/.claude/logs" ]; then
-    cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
-    if [ -n "$cutoff_5h" ]; then
-      for f in "$HOME"/.claude/logs/codex-*.log; do
-        [ -f "$f" ] || continue
-        m=$(stat -f "%m" "$f" 2>/dev/null)
-        if [ -n "$m" ] && [ "$m" -ge "$cutoff_5h" ]; then
-          dispatches_5h=$((dispatches_5h+1))
-          t=$(grep -oE 'tokens=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)
-          [ -n "$t" ] && total_toks_5h=$((total_toks_5h + t))
-        fi
-      done
+      [ -n "$gemini_model_short" ] && gemini_part="${gemini_part} ${DIM}·${RESET} ${gemini_model_color}${gemini_model_short}${RESET}"
     fi
-  fi
-  dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
-  [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
-  dispatch_bar=$(make_bar "$dispatch_pct" 6)
-  dispatch_color=$(pct_color "$dispatch_pct")
-  if [ "$total_toks_5h" -ge 1000 ]; then
-    toks_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $total_toks_5h/1000}")
-  else
-    toks_5h_disp="$total_toks_5h"
-  fi
-  codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
 
-  if [ -f "$codex_last_json" ]; then
-    codex_ts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
-    codex_tokens=$(jq -r '.tokens // 0' "$codex_last_json" 2>/dev/null)
-    codex_elapsed=$(jq -r '.elapsed_s // 0' "$codex_last_json" 2>/dev/null)
-    codex_status=$(jq -r '.status // "unknown"' "$codex_last_json" 2>/dev/null)
-    codex_task=$(jq -r '.task_name // empty' "$codex_last_json" 2>/dev/null)
-
-    if [ -n "$codex_ts" ]; then
-      codex_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$codex_ts" +%s 2>/dev/null)
-      if [ -n "$codex_ts_sec" ]; then
-        codex_now_sec=$(date -u +%s)
-        codex_age_sec=$((codex_now_sec - codex_ts_sec))
-        if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
-        elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
-        elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
-        else codex_age_str="$((codex_age_sec / 86400))d ago"
-        fi
-
-        if [ "$codex_age_sec" -lt 600 ]; then codex_age_color="${CYAN}"
-        else codex_age_color="${DIM}"
-        fi
-
-        if [ "$codex_tokens" -ge 1000 ]; then
-          codex_tok_disp=$(awk "BEGIN{printf \"%.1fk\", $codex_tokens/1000}")
-        else
-          codex_tok_disp="$codex_tokens"
-        fi
-
-        # Color failed runs red; successful runs render in normal text.
-        codex_tok_color="${WHITE}"
-        [ "$codex_status" = "failed" ] && codex_tok_color="${RED}"
-
-        # Prefix task name if present.
-        codex_task_str=""
-        [ -n "$codex_task" ] && codex_task_str="${WHITE}${codex_task}${RESET}${DIM} · ${RESET}"
-
-        codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_task_str}${codex_tok_color}${codex_tok_disp}${RESET} ${DIM}toks · ${RESET}${codex_age_color}${codex_age_str}${RESET}${DIM} · ${codex_elapsed}s${RESET}"
+    gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-100}"
+    gemini_dispatches_5h=0
+    gemini_chars_5h=0
+    if [ -d "$HOME/.claude/logs" ]; then
+      gemini_cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
+      if [ -n "$gemini_cutoff_5h" ]; then
+        for f in "$HOME"/.claude/logs/gemini-*.log; do
+          [ -f "$f" ] || continue
+          m=$(stat -f "%m" "$f" 2>/dev/null)
+          if [ -n "$m" ] && [ "$m" -ge "$gemini_cutoff_5h" ]; then
+            gemini_dispatches_5h=$((gemini_dispatches_5h+1))
+            c=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+            [ -n "$c" ] && gemini_chars_5h=$((gemini_chars_5h + c))
+          fi
+        done
       fi
     fi
-  else
-    codex_part="${codex_part}${SEP}${DIM}no dispatches yet${RESET}"
-  fi
+    gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
+    [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
+    gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 6)
+    gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
+    if [ "$gemini_chars_5h" -ge 1000 ]; then
+      gemini_chars_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars_5h/1000}")
+    else
+      gemini_chars_5h_disp="$gemini_chars_5h"
+    fi
+    gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
 
-  codex_line="$codex_part"
-fi
-
-[ -n "$codex_line" ] && out="${out}\n${codex_line}"
-
-# ── Gemini dispatch line (third row) ─────────────────────────────────────────
-# Mirrors Codex block but uses chars_out instead of tokens (Gemini CLI does not
-# consistently print token counts to stdout on free/OAuth tier). Cap default
-# 100 per 5h — override via GEMINI_DISPATCH_CAP_5H env var.
-gemini_line=""
-gemini_last_json="$HOME/.claude/gemini-last.json"
-gemini_creds="$HOME/.gemini/oauth_creds.json"
-
-if command -v gemini >/dev/null 2>&1 && [ -f "$gemini_creds" ]; then
-  # Label reflects known Pro-tier configuration — no introspection of actual
-  # plan. Edit this literal if you're on the free tier.
-  gemini_part="${GEMINI_PURPLE}${BOLD}gemini pro${RESET}"
-
-  # Append active model from cache file. The CLI does not print its model to
-  # stdout, so we rely on ~/.claude/gemini-model-cache.txt populated by
-  # ~/.claude/scripts/gemini-refresh-model-cache.sh. Cyan when recent dispatch
-  # (activation indicator), dim otherwise.
-  gemini_model_cache="$HOME/.claude/gemini-model-cache.txt"
-  if [ -f "$gemini_model_cache" ]; then
-    gemini_model=$(head -1 "$gemini_model_cache" | tr -d '[:space:]')
-    # Strip the "gemini-" prefix for display brevity (e.g. "2.0-flash")
-    gemini_model_short="${gemini_model#gemini-}"
-    gemini_model_color="${DIM}"
     if [ -f "$gemini_last_json" ]; then
-      gt=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
-      if [ -n "$gt" ]; then
-        gts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gt" +%s 2>/dev/null)
-        if [ -n "$gts" ] && [ "$(( $(date -u +%s) - gts ))" -lt 600 ]; then
-          gemini_model_color="${CYAN}"
+      gemini_ts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
+      gemini_chars=$(jq -r '.chars_out // 0' "$gemini_last_json" 2>/dev/null)
+      gemini_elapsed=$(jq -r '.elapsed_s // 0' "$gemini_last_json" 2>/dev/null)
+      gemini_status=$(jq -r '.status // "unknown"' "$gemini_last_json" 2>/dev/null)
+      gemini_task=$(jq -r '.task_name // empty' "$gemini_last_json" 2>/dev/null)
+
+      if [ -n "$gemini_ts" ]; then
+        gemini_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gemini_ts" +%s 2>/dev/null)
+        if [ -n "$gemini_ts_sec" ]; then
+          gemini_now_sec=$(date -u +%s)
+          gemini_age_sec=$((gemini_now_sec - gemini_ts_sec))
+          if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
+          elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
+          elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
+          else gemini_age_str="$((gemini_age_sec / 86400))d ago"
+          fi
+
+          if [ "$gemini_age_sec" -lt 600 ]; then gemini_age_color="${CYAN}"
+          else gemini_age_color="${DIM}"
+          fi
+
+          if [ "$gemini_chars" -ge 1000 ]; then
+            gemini_char_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars/1000}")
+          else
+            gemini_char_disp="$gemini_chars"
+          fi
+
+          gemini_char_color="${WHITE}"
+          [ "$gemini_status" = "failed" ] && gemini_char_color="${RED}"
+
+          gemini_task_str=""
+          [ -n "$gemini_task" ] && gemini_task_str="${WHITE}${gemini_task}${RESET}${DIM} · ${RESET}"
+
+          gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_task_str}${gemini_char_color}${gemini_char_disp}${RESET} ${DIM}chars · ${RESET}${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ${gemini_elapsed}s${RESET}"
         fi
       fi
+    else
+      gemini_part="${gemini_part}${SEP}${DIM}no dispatches yet${RESET}"
     fi
-    [ -n "$gemini_model_short" ] && gemini_part="${gemini_part} ${DIM}·${RESET} ${gemini_model_color}${gemini_model_short}${RESET}"
+
+    gemini_line="$gemini_part"
   fi
 
-  # Dispatches per rolling 5h window
-  gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-100}"
-  gemini_dispatches_5h=0
-  gemini_chars_5h=0
-  if [ -d "$HOME/.claude/logs" ]; then
-    gemini_cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
-    if [ -n "$gemini_cutoff_5h" ]; then
-      for f in "$HOME"/.claude/logs/gemini-*.log; do
-        [ -f "$f" ] || continue
-        m=$(stat -f "%m" "$f" 2>/dev/null)
-        if [ -n "$m" ] && [ "$m" -ge "$gemini_cutoff_5h" ]; then
-          gemini_dispatches_5h=$((gemini_dispatches_5h+1))
-          c=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
-          [ -n "$c" ] && gemini_chars_5h=$((gemini_chars_5h + c))
-        fi
-      done
-    fi
-  fi
-  gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
-  [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
-  gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 6)
-  gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
-  if [ "$gemini_chars_5h" -ge 1000 ]; then
-    gemini_chars_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars_5h/1000}")
-  else
-    gemini_chars_5h_disp="$gemini_chars_5h"
-  fi
-  gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+  [ -n "$gemini_line" ] && out="${out}\n${gemini_line}"
 
-  if [ -f "$gemini_last_json" ]; then
-    gemini_ts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
-    gemini_chars=$(jq -r '.chars_out // 0' "$gemini_last_json" 2>/dev/null)
-    gemini_elapsed=$(jq -r '.elapsed_s // 0' "$gemini_last_json" 2>/dev/null)
-    gemini_status=$(jq -r '.status // "unknown"' "$gemini_last_json" 2>/dev/null)
-    gemini_task=$(jq -r '.task_name // empty' "$gemini_last_json" 2>/dev/null)
-
-    if [ -n "$gemini_ts" ]; then
-      gemini_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gemini_ts" +%s 2>/dev/null)
-      if [ -n "$gemini_ts_sec" ]; then
-        gemini_now_sec=$(date -u +%s)
-        gemini_age_sec=$((gemini_now_sec - gemini_ts_sec))
-        if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
-        elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
-        elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
-        else gemini_age_str="$((gemini_age_sec / 86400))d ago"
-        fi
-
-        if [ "$gemini_age_sec" -lt 600 ]; then gemini_age_color="${CYAN}"
-        else gemini_age_color="${DIM}"
-        fi
-
-        if [ "$gemini_chars" -ge 1000 ]; then
-          gemini_char_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars/1000}")
-        else
-          gemini_char_disp="$gemini_chars"
-        fi
-
-        gemini_char_color="${WHITE}"
-        [ "$gemini_status" = "failed" ] && gemini_char_color="${RED}"
-
-        # Prefix task name if present.
-        gemini_task_str=""
-        [ -n "$gemini_task" ] && gemini_task_str="${WHITE}${gemini_task}${RESET}${DIM} · ${RESET}"
-
-        gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_task_str}${gemini_char_color}${gemini_char_disp}${RESET} ${DIM}chars · ${RESET}${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ${gemini_elapsed}s${RESET}"
-      fi
-    fi
-  else
-    gemini_part="${gemini_part}${SEP}${DIM}no dispatches yet${RESET}"
-  fi
-
-  gemini_line="$gemini_part"
-fi
-
-[ -n "$gemini_line" ] && out="${out}\n${gemini_line}"
+fi  # end registry/fallback branch
 
 printf "%b" "$out"

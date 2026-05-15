@@ -2,3 +2,4 @@
 *.log
 *-last.json
 session-state.json
+.swarm/

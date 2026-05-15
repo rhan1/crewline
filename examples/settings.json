@@ -1,5 +1,6 @@
 {
   "_comment_about_this_file": "Example snippet showing how to wire the statusline and hooks into ~/.claude/settings.json. Merge these sections into your existing settings.json — don't blindly overwrite. The install.sh script does this merge safely.",
+  "_comment_ruflo": "Remove the PreToolUse block if you skipped RuFlo during install.",
 
   "statusLine": {
     "type": "command",
@@ -15,6 +16,17 @@
           {
             "type": "command",
             "command": "node ~/.claude/hooks/auto-budget-check.js"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/ruflo-model-enforcer.js"
           }
         ]
       }
