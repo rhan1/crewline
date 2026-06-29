@@ -2,9 +2,9 @@
 
 A drop-in Claude Code setup that gives you:
 
-1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity.
-2. **Four slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, and schedule plans for the next rate-limit window.
-3. **Two hooks** that warn you before a heavy turn blows the 5h window, and rotate dispatch logs weekly so `~/.claude/logs/` doesn't grow without bound.
+1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity. Rate limits use **cross-session reconciliation** (every open session converges on one shared number instead of each showing its own stale snapshot); executor rows show a live **`running now`** badge while a dispatch is in flight; and a **`bg-claude`** indicator surfaces background `claude -p` jobs that are otherwise invisible to the 5h bar.
+2. **Slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, schedule plans for the next rate-limit window, and show a live view of native subagents (`/agents`).
+3. **Hooks** that warn you before a heavy turn blows the 5h window, rotate dispatch logs weekly, and (optionally) log native-subagent lifecycle for the `/agents` monitor.
 
 The core idea: keep Claude (Opus / Sonnet) on judgment, debugging, smoke-testing, and architecture. Delegate mechanical code generation and long-context / multi-modal work to Codex and Gemini — they're cheaper, sometimes faster, and each has a capability profile the other can't match.
 
@@ -73,6 +73,7 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `/dispatch-gemini <task>` | Shortcut for `/dispatch gemini` — Gemini for long-context (>150k tokens), multi-modal, parallel-batch |
 | `/budget-check <plan>` | Pre-flight: does this plan fit in the remaining 5h window? Returns ✅ / ⚠️ / ❌ with concrete options |
 | `/execute-at-reset <plan>` | Schedule a plan to auto-execute ~1 min after the next 5h reset (via Claude Code's `CronCreate`) |
+| `/agents` | Live view of native Claude subagents (Agent/Task tool) — running vs done, each one's task, duration, and a completion count. Reads the subagent transcripts Claude Code maintains, so it works across sessions and even when rate-limited |
 
 ## Hooks
 

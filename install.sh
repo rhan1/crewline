@@ -81,7 +81,12 @@ COMP_NAME_5="logrotate"
 COMP_LABEL_5="Log rotation (rotate-logs.sh + weekly-maintenance hook)"
 COMP_FILES_5="scripts/rotate-logs.sh:scripts/rotate-logs.sh hooks/weekly-maintenance.js:hooks/weekly-maintenance.js"
 
-COMP_COUNT=6
+# Index 6: Native-subagent monitor (/agents)
+COMP_NAME_6="agents_monitor"
+COMP_LABEL_6="Native-subagent monitor (/agents — running vs done + a SubagentStart/Stop activity hook)"
+COMP_FILES_6="scripts/agents-status.py:scripts/agents-status.py commands/agents.md:commands/agents.md hooks/agent-activity-log.js:hooks/agent-activity-log.js"
+
+COMP_COUNT=7
 
 # Statusline files — always installed (no prompt).
 STATUSLINE_FILES="statusline.sh:statusline.sh"
@@ -437,12 +442,17 @@ HEADER
   if [ "${INSTALL_4:-0}" -eq 1 ]; then
     pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/ruflo-model-enforcer.js" }'
   fi
+  local subagent_hooks=""
+  if [ "${INSTALL_6:-0}" -eq 1 ]; then
+    subagent_hooks='          { "type": "command", "command": "node ~/.claude/hooks/agent-activity-log.js" }'
+  fi
 
   # Only print the hooks block if at least one hook was installed.
   local has_hooks=0
   [ -n "$user_prompt_hooks" ]  && has_hooks=1
   [ -n "$session_start_hooks" ] && has_hooks=1
   [ -n "$pre_tool_hooks" ]     && has_hooks=1
+  [ -n "$subagent_hooks" ]     && has_hooks=1
 
   if [ "$has_hooks" -eq 1 ]; then
     echo ""
@@ -480,6 +490,26 @@ BLOCK
       {
         "hooks": [
 $session_start_hooks
+        ]
+      }
+    ]$( [ -n "$subagent_hooks" ] && echo "," )
+BLOCK
+    fi
+
+    # SubagentStart/Stop both log lifecycle events for the /agents monitor.
+    if [ -n "$subagent_hooks" ]; then
+      cat <<BLOCK
+    "SubagentStart": [
+      {
+        "hooks": [
+$subagent_hooks
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+$subagent_hooks
         ]
       }
     ]

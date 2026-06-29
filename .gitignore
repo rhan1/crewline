@@ -3,3 +3,7 @@
 *-last.json
 session-state.json
 .swarm/
+
+# Python
+__pycache__/
+*.pyc

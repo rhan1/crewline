@@ -10,15 +10,70 @@
 
 input=$(cat)
 
-# ── Write session state cache so slash commands can read current rate-limit
-# state without re-plumbing Claude Code's internal session info. Statusline
-# already gets this every ~10s via stdin, so it's the cheapest capture point.
+# ── Live-process snapshot (one ps; bracket-trick [x] excludes the grep itself) ─
+# The statusline otherwise shows only COMPLETED dispatches, so a long-running
+# background job — or a headless `claude -p` batch — reads as dead. These detect
+# live processes so active work is visible (see the row code below).
+PS_SNAP=$(ps -axo command 2>/dev/null)
+cp_running=$(printf '%s\n' "$PS_SNAP" | grep -cE '(^|/)[c]laude +(-p|--print)( |$)')
+[[ "$cp_running" =~ ^[0-9]+$ ]] || cp_running=0
+
+# ── Cross-session rate-limit reconciliation (per-session files) ──────────────
+# Rate limits are account-wide, but Claude Code hands each session ONLY its own
+# last-API-response snapshot via stdin — an idle session shows a frozen, often
+# PREVIOUS-window number while a busy one shows the live window, so raw stdin %s
+# disagree across sessions. FIX (race-free): each session writes its snapshot to
+# ~/.claude/.rl/<ppid>.json (own file — no shared-write race); the display
+# reduces across all live files: current window = MAX resets_at; usage = MAX %
+# among sessions in that window. Older-window (stale) sessions are excluded, so a
+# session idle since a past window can't drag the number down. The reconciled
+# values are also written to ~/.claude/.session-state.json for /budget-check etc.
 SESSION_STATE="$HOME/.claude/.session-state.json"
-echo "$input" | jq --arg ts "$(date -u +%s)" '{
+RL_DIR="$HOME/.claude/.rl"
+mkdir -p "$RL_DIR" 2>/dev/null
+now_epoch=$(date -u +%s)
+
+# this session's stdin snapshot (percentages rounded to int; empty -> JSON null)
+in5p=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty'); [ -n "$in5p" ] && in5p=$(printf '%.0f' "$in5p" 2>/dev/null)
+in5r=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
+in7p=$(echo "$input" | jq -r '.rate_limits.weekly.used_percentage // .rate_limits.seven_day.used_percentage // empty'); [ -n "$in7p" ] && in7p=$(printf '%.0f' "$in7p" 2>/dev/null)
+in7r=$(echo "$input" | jq -r '.rate_limits.weekly.resets_at // .rate_limits.seven_day.resets_at // empty')
+
+# write own file ATOMICALLY (temp + mv) so readers never see a partial file
+rl_tmp="$RL_DIR/.$PPID.tmp"
+printf '{"ts":%s,"five_pct":%s,"five_reset":%s,"seven_pct":%s,"seven_reset":%s}\n' \
+  "$now_epoch" "${in5p:-null}" "${in5r:-null}" "${in7p:-null}" "${in7r:-null}" \
+  > "$rl_tmp" 2>/dev/null && mv -f "$rl_tmp" "$RL_DIR/$PPID.json" 2>/dev/null || true
+# drop dead sessions' files (untouched 6h) so they can't skew the reduce
+find "$RL_DIR" -name '*.json' -mmin +360 -delete 2>/dev/null || true
+
+# reduce across live files: current window = max reset; % = max within 1h of it
+RL_TOL=3600
+IFS=$'\t' read -r m5_pct m5_reset m7_pct m7_reset <<< "$(jq -s -r \
+  --argjson now "$now_epoch" --argjson tol "$RL_TOL" '
+  [ .[] | select((($now - (.ts // 0)) <= 21600)) ] as $live |
+  ($live | map(.five_reset  // empty) | max) as $r5 |
+  ($live | map(.seven_reset // empty) | max) as $r7 |
+  [ ( if $r5 == null then "" else ([ $live[] | select((.five_reset  // -1) >= ($r5 - $tol)) | .five_pct  // 0 ] | max // "") end ),
+    ( $r5 // "" ),
+    ( if $r7 == null then "" else ([ $live[] | select((.seven_reset // -1) >= ($r7 - $tol)) | .seven_pct // 0 ] | max // "") end ),
+    ( $r7 // "" )
+  ] | @tsv' "$RL_DIR"/*.json 2>/dev/null)"
+
+# fallback: if the reduce produced nothing, degrade to this session's own snapshot
+[ -z "$m5_pct" ] && [ -n "$in5p" ] && { m5_pct="$in5p"; m5_reset="$in5r"; }
+[ -z "$m7_pct" ] && [ -n "$in7p" ] && { m7_pct="$in7p"; m7_reset="$in7r"; }
+
+# persist reconciled values for /budget-check + slash commands
+echo "$input" | jq \
+  --arg ts "$now_epoch" \
+  --argjson m5p "${m5_pct:-null}" --argjson m5r "${m5_reset:-null}" \
+  --argjson m7p "${m7_pct:-null}" --argjson m7r "${m7_reset:-null}" '{
   timestamp: ($ts | tonumber),
   model: (.model.display_name // null),
   context_window: (.context_window // {}),
-  rate_limits: (.rate_limits // {}),
+  rate_limits: { five_hour: {used_percentage: $m5p, resets_at: $m5r},
+                 seven_day: {used_percentage: $m7p, resets_at: $m7r} },
   cost: (.cost // {}),
   cwd: (.workspace.current_dir // .cwd // null)
 }' > "$SESSION_STATE" 2>/dev/null || true
@@ -37,6 +92,11 @@ ORANGE='\033[38;2;230;150;60m'
 SILVER='\033[38;2;200;210;220m'
 CODEX_GREEN='\033[38;2;16;163;127m'
 GEMINI_PURPLE='\033[38;2;156;93;247m'
+
+# Live headless `claude -p` jobs burn account budget but never refresh the 5h bar
+# (no interactive API call), so the bar can read 0% while real Claude work runs.
+cp_run_part=""
+[ "$cp_running" -gt 0 ] && cp_run_part="${CYAN}${BOLD}${cp_running} bg-claude${RESET}${DIM} running${RESET}"
 
 SEP="${GRAY} | ${RESET}"
 
@@ -180,16 +240,25 @@ else
 fi
 
 # ── 5-hour rate limit + bar + reset countdown ─────────────────────────────────
-five_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
-if [ -n "$five_pct" ]; then
-  five_int=$(printf '%.0f' "$five_pct")
-  five_bar=$(make_bar "$five_int" 10)
-  five_color=$(pct_color "$five_int")
-  five_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty')
-  five_eta=$(time_until "$five_reset" 18000)
+# Renders the reconciled m5_* values (shared across sessions), NOT this session's
+# raw stdin snapshot — that's what makes every window agree.
+if [ -n "$m5_pct" ] && [ -n "$m5_reset" ]; then
+  now5=$(date -u +%s)
+  if [ "$now5" -ge "$m5_reset" ]; then
+    five_int=0          # window elapsed & no session has a fresher reading -> reset
+  else
+    five_int=$m5_pct
+  fi
+  if [ "$five_int" -ge 100 ]; then
+    # at/over budget: bar maxes out, real number bold-red (cap throttles, not a hard block)
+    five_bar=$(make_bar 100 10); five_color="${BOLD}${RED}"
+  else
+    five_bar=$(make_bar "$five_int" 10); five_color=$(pct_color "$five_int")
+  fi
   five_part="${five_bar} ${DIM}5h:${RESET}${five_color}${five_int}%${RESET}"
+  five_eta=$(time_until "$m5_reset" 18000)
   if [ -n "$five_eta" ]; then
-    five_clock=$(reset_clock "$five_reset" 18000)
+    five_clock=$(reset_clock "$m5_reset" 18000)
     if [ -n "$five_clock" ]; then
       five_part="${five_part} ${DIM}(${five_eta} - ${five_clock})${RESET}"
     else
@@ -206,19 +275,22 @@ seven_pct=$(echo "$input" | jq -r '
   .rate_limits.seven_day.used_percentage //
   empty
 ')
-if [ -n "$seven_pct" ]; then
-  seven_int=$(printf '%.0f' "$seven_pct")
-  seven_bar=$(make_bar "$seven_int" 10)
-  seven_color=$(pct_color "$seven_int")
-  seven_reset=$(echo "$input" | jq -r '
-    .rate_limits.weekly.resets_at //
-    .rate_limits.seven_day.resets_at //
-    empty
-  ')
-  seven_eta=$(time_until "$seven_reset" 604800)
+if [ -n "$m7_pct" ] && [ -n "$m7_reset" ]; then
+  now7=$(date -u +%s)
+  if [ "$now7" -ge "$m7_reset" ]; then
+    seven_int=0
+  else
+    seven_int=$m7_pct
+  fi
+  if [ "$seven_int" -ge 100 ]; then
+    seven_bar=$(make_bar 100 10); seven_color="${BOLD}${RED}"
+  else
+    seven_bar=$(make_bar "$seven_int" 10); seven_color=$(pct_color "$seven_int")
+  fi
   seven_part="${seven_bar} ${DIM}7d:${RESET}${seven_color}${seven_int}%${RESET}"
+  seven_eta=$(time_until "$m7_reset" 604800)
   if [ -n "$seven_eta" ]; then
-    seven_clock=$(reset_clock "$seven_reset" 604800)
+    seven_clock=$(reset_clock "$m7_reset" 604800)
     if [ -n "$seven_clock" ]; then
       seven_part="${seven_part} ${DIM}(${seven_eta} - ${seven_clock})${RESET}"
     else
@@ -357,6 +429,7 @@ fi
 # ── Assemble ──────────────────────────────────────────────────────────────────
 out="${model_part}${SEP}${ctx_part}"
 [ -n "$five_part" ]  && out="${out}${SEP}${five_part}"
+[ -n "$cp_run_part" ] && out="${out}${SEP}${cp_run_part}"
 [ -n "$seven_part" ] && out="${out}${SEP}${seven_part}"
 [ -n "$cache_part" ] && out="${out}${SEP}${cache_part}"
 out="${out}${SEP}${cost_part}"
@@ -477,6 +550,11 @@ if [ -f "$REGISTRY" ] && jq empty "$REGISTRY" 2>/dev/null; then
       m_part="${m_part}${SEP}${DIM}no dispatches yet${RESET}"
     fi
 
+    # live: this model's CLI is actively running a dispatch right now (a long job
+    # leaves "last:" stale until it finishes — show that it's alive instead)
+    if printf '%s\n' "$PS_SNAP" | grep -qE "(^|/)${m_command}( |\$)|${m_command} +exec"; then
+      m_part="${m_part}${SEP}${GREEN}${BOLD}running now${RESET}"
+    fi
     out="${out}\n${m_part}"
     row_count=$((row_count + 1))
   done <<EOF
@@ -548,6 +626,7 @@ else
     codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
     dispatches_5h=0
     total_toks_5h=0
+    codex_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
     if [ -d "$HOME/.claude/logs" ]; then
       cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
       if [ -n "$cutoff_5h" ]; then
@@ -556,6 +635,7 @@ else
           m=$(stat -f "%m" "$f" 2>/dev/null)
           if [ -n "$m" ] && [ "$m" -ge "$cutoff_5h" ]; then
             dispatches_5h=$((dispatches_5h+1))
+            [ "$m" -gt "$codex_log_ts" ] && codex_log_ts=$m
             t=$(grep -oE 'tokens=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)
             [ -n "$t" ] && total_toks_5h=$((total_toks_5h + t))
           fi
@@ -573,7 +653,28 @@ else
     fi
     codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
 
+    codex_json_ts_sec=0
     if [ -f "$codex_last_json" ]; then
+      cjts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
+      [ -n "$cjts" ] && codex_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$cjts" +%s 2>/dev/null)
+      [[ "$codex_json_ts_sec" =~ ^[0-9]+$ ]] || codex_json_ts_sec=0
+    fi
+    codex_now_sec=$(date -u +%s)
+    if printf '%s\n' "$PS_SNAP" | grep -qE '[c]odex +exec'; then
+      # a codex dispatch is running right now (last.json updates only on completion)
+      codex_part="${codex_part}${SEP}${GREEN}${BOLD}running now${RESET}"
+    elif [ "${codex_log_ts:-0}" -gt "$codex_json_ts_sec" ]; then
+      # most recent run wrote only a dispatch log (bypassed the wrapper) — use the
+      # log mtime so a recent run isn't shown as a stale days-old "last:"
+      codex_age_sec=$((codex_now_sec - codex_log_ts))
+      if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
+      elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
+      elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
+      else codex_age_str="$((codex_age_sec / 86400))d ago"
+      fi
+      codex_age_color="${DIM}"; [ "$codex_age_sec" -lt 600 ] && codex_age_color="${CYAN}"
+      codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_age_color}${codex_age_str}${RESET}${DIM} · ran${RESET}"
+    elif [ -f "$codex_last_json" ]; then
       codex_ts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
       codex_tokens=$(jq -r '.tokens // 0' "$codex_last_json" 2>/dev/null)
       codex_elapsed=$(jq -r '.elapsed_s // 0' "$codex_last_json" 2>/dev/null)
@@ -647,6 +748,7 @@ else
     gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-100}"
     gemini_dispatches_5h=0
     gemini_chars_5h=0
+    gemini_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
     if [ -d "$HOME/.claude/logs" ]; then
       gemini_cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
       if [ -n "$gemini_cutoff_5h" ]; then
@@ -655,6 +757,7 @@ else
           m=$(stat -f "%m" "$f" 2>/dev/null)
           if [ -n "$m" ] && [ "$m" -ge "$gemini_cutoff_5h" ]; then
             gemini_dispatches_5h=$((gemini_dispatches_5h+1))
+            [ "$m" -gt "$gemini_log_ts" ] && gemini_log_ts=$m
             c=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
             [ -n "$c" ] && gemini_chars_5h=$((gemini_chars_5h + c))
           fi
@@ -672,7 +775,25 @@ else
     fi
     gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
 
+    gemini_json_ts_sec=0
     if [ -f "$gemini_last_json" ]; then
+      gjts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
+      [ -n "$gjts" ] && gemini_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gjts" +%s 2>/dev/null)
+      [[ "$gemini_json_ts_sec" =~ ^[0-9]+$ ]] || gemini_json_ts_sec=0
+    fi
+    gemini_now_sec=$(date -u +%s)
+    if printf '%s\n' "$PS_SNAP" | grep -qE '(^|/)[g]emini( |$)'; then
+      gemini_part="${gemini_part}${SEP}${GREEN}${BOLD}running now${RESET}"
+    elif [ "${gemini_log_ts:-0}" -gt "$gemini_json_ts_sec" ]; then
+      gemini_age_sec=$((gemini_now_sec - gemini_log_ts))
+      if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
+      elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
+      elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
+      else gemini_age_str="$((gemini_age_sec / 86400))d ago"
+      fi
+      gemini_age_color="${DIM}"; [ "$gemini_age_sec" -lt 600 ] && gemini_age_color="${CYAN}"
+      gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ran${RESET}"
+    elif [ -f "$gemini_last_json" ]; then
       gemini_ts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
       gemini_chars=$(jq -r '.chars_out // 0' "$gemini_last_json" 2>/dev/null)
       gemini_elapsed=$(jq -r '.elapsed_s // 0' "$gemini_last_json" 2>/dev/null)
