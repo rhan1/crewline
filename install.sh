@@ -59,7 +59,7 @@ COMP_FILES_1="scripts/gemini-dispatch.sh:scripts/gemini-dispatch.sh scripts/gemi
 # Generic dispatcher + /dispatch command (always installed when codex or gemini is)
 # These are added programmatically to ACTIVE_FILES in build_files_list() when any
 # dispatch component is selected — no separate prompt needed.
-DISPATCH_GENERIC_FILES="scripts/llm-dispatch.sh:scripts/llm-dispatch.sh commands/dispatch.md:commands/dispatch.md"
+DISPATCH_GENERIC_FILES="scripts/llm-dispatch.sh:scripts/llm-dispatch.sh scripts/dispatch-common.sh:scripts/dispatch-common.sh commands/dispatch.md:commands/dispatch.md"
 
 # Index 2: Budget check
 COMP_NAME_2="budget"

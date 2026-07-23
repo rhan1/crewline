@@ -7,17 +7,20 @@
 # Writes:
 #   ~/.claude/logs/codex-<ISO>.log       — full stdout+stderr of codex exec
 #   ~/.claude/codex-last.json            — { timestamp, task_name, tokens,
-#                                            elapsed_s, status, exit_code,
-#                                            spec_path, log_path, model,
-#                                            reasoning_effort }
+#                                            elapsed_s, status, status_detail,
+#                                            exit_code, spec_path, log_path,
+#                                            model, reasoning_effort }
 #   ~/.claude/codex-auth-cache.txt       — refreshed for statusline
 #
 # Exit code passes through from `codex exec` so callers can branch on failure.
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/dispatch-common.sh"
+
 SPEC_FILE="${1:-}"
-TASK_NAME="${2:-$(basename "${SPEC_FILE:-dispatch}" .txt)}"
+TASK_NAME="$(dc_task_name "${SPEC_FILE:-dispatch}" "${2:-}")"
 
 if [ -z "$SPEC_FILE" ] || [ ! -f "$SPEC_FILE" ]; then
   echo "usage: codex-dispatch.sh <spec-file> [task-name]" >&2
@@ -32,7 +35,6 @@ mkdir -p "$LOG_DIR"
 TS_FILE="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/codex-${TS_FILE}.log"
 LAST_JSON="$CLAUDE_DIR/codex-last.json"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Refresh auth cache in background (cheap; updates codex-auth-cache.txt)
 "$SCRIPT_DIR/codex-refresh-auth-cache.sh" >/dev/null 2>&1 &
@@ -43,54 +45,83 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   echo ""
 } | tee -a "$LOG_FILE"
 
-START_EPOCH="$(date +%s)"
+START_EPOCH="$(dc_now)"
 
-codex exec --dangerously-bypass-approvals-and-sandbox "$(cat "$SPEC_FILE")" 2>&1 \
-  | tee -a "$LOG_FILE"
-EXIT_CODE="${PIPESTATUS[0]}"
+# </dev/null: codex exec blocks forever ("Reading additional input from stdin...")
+# when stdin is an open non-tty pipe (cron/hooks/backgrounded dispatch).
+STALL_TICKS="${CODEX_STALL_MINS:-10}"
+HARD_CAP_SECS="${CODEX_EXEC_TIMEOUT_SECS:-2700}"
+STATUS_FILE="$(mktemp "${TMPDIR:-/tmp}/codex-dispatch-status.XXXXXX")" || exit 1
 
-END_EPOCH="$(date +%s)"
-ELAPSED="$(( END_EPOCH - START_EPOCH ))"
+set -m
+(
+  set +m
+  codex exec --dangerously-bypass-approvals-and-sandbox "$(cat "$SPEC_FILE")" </dev/null 2>&1 \
+    | tee -a "$LOG_FILE"
+  PIPE_EXIT="${PIPESTATUS[0]}"
+  exit "$PIPE_EXIT"
+) &
+TARGET_PID=$!
+set +m
 
-if [ "$EXIT_CODE" -eq 0 ]; then STATUS="success"; else STATUS="failed"; fi
+dc_watchdog_start "$LOG_FILE" "$TARGET_PID" "$STALL_TICKS" "$HARD_CAP_SECS" "$TASK_NAME" "$STATUS_FILE"
+wait "$TARGET_PID"
+EXIT_CODE=$?
+
+END_EPOCH="$(dc_now)"
+dc_watchdog_stop
+WATCHDOG_STATUS="$(tr -d '\r\n' < "$STATUS_FILE")"
+rm -f "$STATUS_FILE"
+
+ELAPSED="$(dc_elapsed "$START_EPOCH" "$END_EPOCH")"
 
 # Parse "tokens used\nNNN,NNN" block from log (case-insensitive, tolerate commas)
-TOKENS="$(awk '
+TOKENS="$(tr -d '\000' < "$LOG_FILE" | LC_ALL=C awk '
   tolower($0) ~ /^[[:space:]]*tokens?[[:space:]]+used/ { want=1; next }
   want {
     t=$0; gsub(/,/, "", t); gsub(/[[:space:]]/, "", t)
     if (t ~ /^[0-9]+$/) { print t; exit }
   }
-' "$LOG_FILE")"
+')"
 [ -z "$TOKENS" ] && TOKENS=0
 
 # Capture active model from the "model: <id>" line Codex prints at session start.
-MODEL="$(grep -m1 -E '^model:[[:space:]]' "$LOG_FILE" 2>/dev/null | awk '{print $2}')"
-[ -z "$MODEL" ] && MODEL="unknown"
+MODEL="$(grep -m1 -aE '^model:[[:space:]]' "$LOG_FILE" 2>/dev/null | awk '{print $2}')"
+# -a + an allowlist prevent binary-log diagnostics from being parsed as a model.
+case "$MODEL" in (*[!A-Za-z0-9._-]*|"") MODEL="unknown" ;; esac
 
 # Capture reasoning effort from the "reasoning effort: <level>" line (default: none).
-REASONING="$(grep -m1 -E '^reasoning effort:[[:space:]]' "$LOG_FILE" 2>/dev/null | awk '{print $3}')"
-[ -z "$REASONING" ] && REASONING="none"
+REASONING="$(grep -m1 -aE '^reasoning effort:[[:space:]]' "$LOG_FILE" 2>/dev/null | awk '{print $3}')"
+case "$REASONING" in (minimal|low|medium|high|xhigh|ultra|none) ;; (*) REASONING="none" ;; esac
+
+case "$WATCHDOG_STATUS" in
+  stalled)
+    STATUS="stalled"
+    STATUS_DETAIL="no log growth for ${STALL_TICKS}m"
+    ;;
+  timeout)
+    STATUS="timeout"
+    STATUS_DETAIL="hard cap exceeded (${HARD_CAP_SECS}s)"
+    ;;
+  *)
+    if [ "$EXIT_CODE" -ne 0 ]; then
+      STATUS="error"
+      STATUS_DETAIL="codex exited with code $EXIT_CODE"
+    elif [ "$TOKENS" -eq 0 ]; then
+      STATUS="suspect"
+      STATUS_DETAIL="no token count found in log"
+    else
+      STATUS="success"
+      STATUS_DETAIL="completed with nonzero token count"
+    fi
+    ;;
+esac
 
 TASK_NAME="$TASK_NAME" TOKENS="$TOKENS" ELAPSED="$ELAPSED" STATUS="$STATUS" \
-EXIT_CODE="$EXIT_CODE" SPEC_FILE="$SPEC_FILE" LOG_FILE="$LOG_FILE" \
+STATUS_DETAIL="$STATUS_DETAIL" EXIT_CODE="$EXIT_CODE" \
+SPEC_FILE="$SPEC_FILE" LOG_FILE="$LOG_FILE" \
 MODEL="$MODEL" REASONING="$REASONING" \
-python3 - > "$LAST_JSON" <<'PY'
-import json, os
-from datetime import datetime, timezone
-print(json.dumps({
-  "timestamp":         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-  "task_name":         os.environ.get("TASK_NAME", ""),
-  "model":             os.environ.get("MODEL", "unknown"),
-  "reasoning_effort":  os.environ.get("REASONING", "none"),
-  "tokens":            int(os.environ.get("TOKENS") or 0),
-  "elapsed_s":         int(os.environ.get("ELAPSED") or 0),
-  "status":            os.environ.get("STATUS", "unknown"),
-  "exit_code":         int(os.environ.get("EXIT_CODE") or 0),
-  "spec_path":         os.environ.get("SPEC_FILE", ""),
-  "log_path":          os.environ.get("LOG_FILE", ""),
-}, indent=2))
-PY
+dc_write_last_json "$LAST_JSON" codex
 
 {
   echo ""
