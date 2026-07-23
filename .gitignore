@@ -7,3 +7,6 @@ session-state.json
 # Python
 __pycache__/
 *.pyc
+
+# macOS custom folder icons (Icon + CR)
+Icon?

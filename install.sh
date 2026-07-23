@@ -49,7 +49,7 @@ done
 # Index 0: Codex dispatch
 COMP_NAME_0="codex"
 COMP_LABEL_0="Codex dispatch (/dispatch-codex, scripts, auth-cache refresh)"
-COMP_FILES_0="scripts/codex-dispatch.sh:scripts/codex-dispatch.sh scripts/codex-refresh-auth-cache.sh:scripts/codex-refresh-auth-cache.sh commands/dispatch-codex.md:commands/dispatch-codex.md"
+COMP_FILES_0="scripts/codex-dispatch.sh:scripts/codex-dispatch.sh scripts/codex-refresh-auth-cache.sh:scripts/codex-refresh-auth-cache.sh scripts/codex-rate-limits-refresh.mjs:scripts/codex-rate-limits-refresh.mjs commands/dispatch-codex.md:commands/dispatch-codex.md"
 
 # Index 1: Gemini dispatch
 COMP_NAME_1="gemini"
@@ -223,7 +223,7 @@ install_files() {
 # Uninstall: walk the full set of all known files.
 # ---------------------------------------------------------------------------
 uninstall_files() {
-  local all_files="$STATUSLINE_FILES $COMP_FILES_0 $COMP_FILES_1 $COMP_FILES_2 $COMP_FILES_3 $COMP_FILES_4 $COMP_FILES_5 $DISPATCH_GENERIC_FILES"
+  local all_files="$STATUSLINE_FILES $COMP_FILES_0 $COMP_FILES_1 $COMP_FILES_2 $COMP_FILES_3 $COMP_FILES_4 $COMP_FILES_5 $COMP_FILES_6 $DISPATCH_GENERIC_FILES"
   echo "-> Uninstalling from $CLAUDE_DIR"
   for entry in $all_files; do
     local rel="${entry##*:}"

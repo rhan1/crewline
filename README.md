@@ -2,7 +2,7 @@
 
 A drop-in Claude Code setup that gives you:
 
-1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity. Rate limits use **cross-session reconciliation** (every open session converges on one shared number instead of each showing its own stale snapshot); executor rows show a live **`running now`** badge while a dispatch is in flight; and a **`bg-claude`** indicator surfaces background `claude -p` jobs that are otherwise invisible to the 5h bar.
+1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity. Rate limits use **cross-session reconciliation** (every open session converges on one shared number instead of each showing its own stale snapshot); the Codex row shows **real Codex rate-limit windows** (fetched in the background from `codex app-server`, falling back to a dispatch-count estimate when unavailable); executor rows show a live **`running now`** badge while a dispatch or interactive TUI session is in flight; and a **`bg-claude`** indicator surfaces background `claude -p` jobs that are otherwise invisible to the 5h bar.
 2. **Slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, schedule plans for the next rate-limit window, and show a live view of native subagents (`/agents`).
 3. **Hooks** that warn you before a heavy turn blows the 5h window, rotate dispatch logs weekly, and (optionally) log native-subagent lifecycle for the `/agents` monitor.
 
@@ -12,7 +12,7 @@ The core idea: keep Claude (Opus / Sonnet) on judgment, debugging, smoke-testing
 
 ```
 Opus 4.7 (1M context) | [████░░░░░░] 38% | [██░░░░░░░░] 5h:20% (4h 52m - 05:01) | [█████▉░░░░] 7d:59% (3d 13h - 13:09) | cache:82% (saved $4.21) | $31.32 | 2797m | @yourname
-codex plus · gpt-5.4 | [██░░░░] 8/~50 · 42.1k toks (5h) | last: scraper-api · 6.2k toks · 2m ago · 47s
+codex plus · gpt-5.4 | [█▋░░░░] 7d:27% (5d 21h - 16:49) | 42.1k toks (5h) | last: scraper-api · 6.2k toks · 2m ago · 47s
 gemini pro · 3.1-pro-preview | [▌░░░░░] 2/~100 · 8.4k chars (5h) | last: summarize-log · 4.1k chars · 12m ago · 18s
 ```
 

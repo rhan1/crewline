@@ -623,6 +623,22 @@ else
         ;;
     esac
 
+    # Real Codex rate limits (primary/secondary windows) via a background
+    # refresher that asks `codex app-server` — replaces the dispatch-count
+    # estimate below whenever the cache is populated.
+    codex_limits_cache="$HOME/.claude/codex-rate-limits.json"
+    codex_limits_refresh="$HOME/.claude/scripts/codex-rate-limits-refresh.mjs"
+    codex_limits_fresh=0
+    if [ -f "$codex_limits_cache" ]; then
+      codex_limits_mtime=$(stat -f "%m" "$codex_limits_cache" 2>/dev/null)
+      if [[ "$codex_limits_mtime" =~ ^[0-9]+$ ]] && [ "$((now_epoch - codex_limits_mtime))" -lt 60 ]; then
+        codex_limits_fresh=1
+      fi
+    fi
+    if [ "$codex_limits_fresh" -eq 0 ] && [ -x "$codex_limits_refresh" ]; then
+      nohup "$codex_limits_refresh" </dev/null >/dev/null 2>&1 &
+    fi
+
     codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
     dispatches_5h=0
     total_toks_5h=0
@@ -651,7 +667,41 @@ else
     else
       toks_5h_disp="$total_toks_5h"
     fi
-    codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+    codex_limits_part=""
+    if [ -f "$codex_limits_cache" ]; then
+      while IFS=$'\t' read -r codex_limit_pct codex_limit_minutes codex_limit_reset; do
+        [[ "$codex_limit_pct" =~ ^[0-9]+$ ]] || continue
+        [[ "$codex_limit_minutes" =~ ^[0-9]+$ ]] || continue
+        [[ "$codex_limit_reset" =~ ^[0-9]+$ ]] || continue
+        if [ "$codex_limit_minutes" -ge 1440 ] && [ "$((codex_limit_minutes % 1440))" -eq 0 ]; then
+          codex_limit_label="$((codex_limit_minutes / 1440))d"
+        elif [ "$codex_limit_minutes" -ge 60 ] && [ "$((codex_limit_minutes % 60))" -eq 0 ]; then
+          codex_limit_label="$((codex_limit_minutes / 60))h"
+        else
+          codex_limit_label="${codex_limit_minutes}m"
+        fi
+        codex_limit_window=$((codex_limit_minutes * 60))
+        codex_limit_remaining=$(time_until "$codex_limit_reset" "$codex_limit_window")
+        codex_limit_clock=$(reset_clock "$codex_limit_reset" "$codex_limit_window")
+        # Match the main row's treatment: dim label, gradient % only, RESET
+        # before the dim parens — pct_color must NOT wrap the countdown, or
+        # DIM just stacks faint-green on it instead of gray.
+        codex_limit_text="${DIM}${codex_limit_label}:${RESET}$(pct_color "$codex_limit_pct")${codex_limit_pct}%${RESET}"
+        if [ -n "$codex_limit_remaining" ] && [ -n "$codex_limit_clock" ]; then
+          codex_limit_text="${codex_limit_text} ${DIM}(${codex_limit_remaining} - ${codex_limit_clock})${RESET}"
+        fi
+        codex_limit_segment="$(make_bar "$codex_limit_pct" 6) ${codex_limit_text}"
+        if [ -n "$codex_limits_part" ]; then
+          codex_limits_part="${codex_limits_part} ${DIM}·${RESET} "
+        fi
+        codex_limits_part="${codex_limits_part}${codex_limit_segment}"
+      done < <(jq -r '(.rate_limits.primary, .rate_limits.secondary) | select(type == "object") | select((.used_percent | type) == "number" and (.window_duration_mins | type) == "number" and (.resets_at | type) == "number") | [.used_percent, .window_duration_mins, .resets_at] | @tsv' "$codex_limits_cache" 2>/dev/null)
+    fi
+    if [ -n "$codex_limits_part" ]; then
+      codex_part="${codex_part}${SEP}${codex_limits_part}${SEP}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+    else
+      codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+    fi
 
     codex_json_ts_sec=0
     if [ -f "$codex_last_json" ]; then
@@ -660,8 +710,13 @@ else
       [[ "$codex_json_ts_sec" =~ ^[0-9]+$ ]] || codex_json_ts_sec=0
     fi
     codex_now_sec=$(date -u +%s)
-    if printf '%s\n' "$PS_SNAP" | grep -qE '[c]odex +exec'; then
-      # a codex dispatch is running right now (last.json updates only on completion)
+    codex_live=$(printf '%s\n' "$PS_SNAP" | awk '/(^|\/)codex( |$)/ && $0 !~ /app-server/ { count++ } END { print count + 0 }')
+    if [ "${codex_live:-0}" -gt 0 ]; then
+      # a codex run (exec dispatch OR interactive TUI) is live right now
+      # (last.json updates only on completion). app-server is excluded anywhere
+      # in the line — both the rate-limits refresher's `codex app-server` and
+      # ChatGPT.app's embedded `codex -c ... app-server` (flags in between)
+      # would otherwise light this up permanently.
       codex_part="${codex_part}${SEP}${GREEN}${BOLD}running now${RESET}"
     elif [ "${codex_log_ts:-0}" -gt "$codex_json_ts_sec" ]; then
       # most recent run wrote only a dispatch log (bypassed the wrapper) — use the
