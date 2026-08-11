@@ -86,7 +86,12 @@ COMP_NAME_6="agents_monitor"
 COMP_LABEL_6="Native-subagent monitor (/agents — running vs done + a SubagentStart/Stop activity hook)"
 COMP_FILES_6="scripts/agents-status.py:scripts/agents-status.py commands/agents.md:commands/agents.md hooks/agent-activity-log.js:hooks/agent-activity-log.js"
 
-COMP_COUNT=7
+# Index 7: Burn-rate advisor
+COMP_NAME_7="burn_rate"
+COMP_LABEL_7="Burn-rate advisor (/burn + a hook that widens fan-out when 5h budget would otherwise expire unused)"
+COMP_FILES_7="hooks/burn-rate-advisor.js:hooks/burn-rate-advisor.js commands/burn.md:commands/burn.md"
+
+COMP_COUNT=8
 
 # Statusline files — always installed (no prompt).
 STATUSLINE_FILES="statusline.sh:statusline.sh"
@@ -436,11 +441,25 @@ HEADER
   if [ "${INSTALL_2:-0}" -eq 1 ]; then
     user_prompt_hooks='          { "type": "command", "command": "node ~/.claude/hooks/auto-budget-check.js" }'
   fi
+  if [ "${INSTALL_7:-0}" -eq 1 ]; then
+    if [ -n "$user_prompt_hooks" ]; then
+      user_prompt_hooks="${user_prompt_hooks},
+          { \"type\": \"command\", \"command\": \"node ~/.claude/hooks/burn-rate-advisor.js\" }"
+    else
+      user_prompt_hooks='          { "type": "command", "command": "node ~/.claude/hooks/burn-rate-advisor.js" }'
+    fi
+  fi
   if [ "${INSTALL_5:-0}" -eq 1 ]; then
     session_start_hooks='          { "type": "command", "command": "node ~/.claude/hooks/weekly-maintenance.js" }'
   fi
   if [ "${INSTALL_4:-0}" -eq 1 ]; then
     pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/ruflo-model-enforcer.js" }'
+  fi
+  # The burn advisor also fires at the fan-out decision point. It needs a WIDER
+  # matcher than RuFlo (Workflow calls too), so it gets its own PreToolUse entry.
+  local burn_pre_hooks=""
+  if [ "${INSTALL_7:-0}" -eq 1 ]; then
+    burn_pre_hooks='          { "type": "command", "command": "node ~/.claude/hooks/burn-rate-advisor.js" }'
   fi
   local subagent_hooks=""
   if [ "${INSTALL_6:-0}" -eq 1 ]; then
@@ -452,6 +471,7 @@ HEADER
   [ -n "$user_prompt_hooks" ]  && has_hooks=1
   [ -n "$session_start_hooks" ] && has_hooks=1
   [ -n "$pre_tool_hooks" ]     && has_hooks=1
+  [ -n "$burn_pre_hooks" ]     && has_hooks=1
   [ -n "$subagent_hooks" ]     && has_hooks=1
 
   if [ "$has_hooks" -eq 1 ]; then
@@ -459,46 +479,71 @@ HEADER
     echo "Hooks (merge into existing \"hooks\" section if present):"
     echo "  \"hooks\": {"
 
+    # Each event block is collected, then joined with commas at the end. Do NOT
+    # hardcode a trailing comma per block: whichever block happens to be last
+    # must not have one, or the emitted snippet is invalid JSON the moment a
+    # user pastes it into settings.json.
+    # Portable accumulator (no arrays — bash indexes from 0, zsh from 1, and
+    # this file gets sourced by both in testing).
+    local all_blocks=""
+    add_block() { [ -n "$all_blocks" ] && all_blocks="${all_blocks},
+"; all_blocks="${all_blocks}$1"; }
+
     if [ -n "$user_prompt_hooks" ]; then
-      cat <<BLOCK
+      add_block "$(cat <<BLOCK
     "UserPromptSubmit": [
       {
         "hooks": [
 $user_prompt_hooks
         ]
       }
-    ],
+    ]
 BLOCK
+)"
     fi
 
-    if [ -n "$pre_tool_hooks" ]; then
-      cat <<BLOCK
-    "PreToolUse": [
+    if [ -n "$pre_tool_hooks" ] || [ -n "$burn_pre_hooks" ]; then
+      pre_entries=""
+      [ -n "$pre_tool_hooks" ] && pre_entries="$(cat <<BLOCK
       {
         "matcher": "Agent",
         "hooks": [
 $pre_tool_hooks
         ]
       }
-    ],
 BLOCK
+)"
+      if [ -n "$burn_pre_hooks" ]; then
+        [ -n "$pre_entries" ] && pre_entries="${pre_entries},"
+        pre_entries="${pre_entries}$(cat <<BLOCK
+      {
+        "matcher": "Agent|Workflow",
+        "hooks": [
+$burn_pre_hooks
+        ]
+      }
+BLOCK
+)"
+      fi
+      add_block "$(printf '    "PreToolUse": [\n%s\n    ]' "$pre_entries")"
     fi
 
     if [ -n "$session_start_hooks" ]; then
-      cat <<BLOCK
+      add_block "$(cat <<BLOCK
     "SessionStart": [
       {
         "hooks": [
 $session_start_hooks
         ]
       }
-    ]$( [ -n "$subagent_hooks" ] && echo "," )
+    ]
 BLOCK
+)"
     fi
 
     # SubagentStart/Stop both log lifecycle events for the /agents monitor.
     if [ -n "$subagent_hooks" ]; then
-      cat <<BLOCK
+      add_block "$(cat <<BLOCK
     "SubagentStart": [
       {
         "hooks": [
@@ -514,7 +559,10 @@ $subagent_hooks
       }
     ]
 BLOCK
+)"
     fi
+
+    printf '%s\n' "$all_blocks"
 
     echo "  }"
   fi

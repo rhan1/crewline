@@ -4,7 +4,7 @@ A drop-in Claude Code setup that gives you:
 
 1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity. Rate limits use **cross-session reconciliation** (every open session converges on one shared number instead of each showing its own stale snapshot); the Codex row shows **real Codex rate-limit windows** (fetched in the background from `codex app-server`, falling back to a dispatch-count estimate when unavailable); executor rows show a live **`running now`** badge while a dispatch or interactive TUI session is in flight; and a **`bg-claude`** indicator surfaces background `claude -p` jobs that are otherwise invisible to the 5h bar.
 2. **Slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, schedule plans for the next rate-limit window, and show a live view of native subagents (`/agents`). Dispatch wrappers carry a built-in **watchdog** (background 60s poll — kills and notifies on stalled or overtime runs, no GNU `timeout` needed) and record honest statuses (`timeout` / `stalled` / `empty` / `suspect`) with a `status_detail` field instead of trusting exit-code success.
-3. **Hooks** that warn you before a heavy turn blows the 5h window, rotate dispatch logs weekly, and (optionally) log native-subagent lifecycle for the `/agents` monitor.
+3. **Hooks** that warn you before a heavy turn blows the 5h window, tell you when to *spend* surplus budget that would otherwise expire (and when to pull back), rotate dispatch logs weekly, and (optionally) log native-subagent lifecycle for the `/agents` monitor.
 
 The core idea: keep Claude (Opus / Sonnet) on judgment, debugging, smoke-testing, and architecture. Delegate mechanical code generation and long-context / multi-modal work to Codex and Gemini — they're cheaper, sometimes faster, and each has a capability profile the other can't match.
 
@@ -73,12 +73,14 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `/dispatch-gemini <task>` | Shortcut for `/dispatch gemini` — Gemini for long-context (>150k tokens), multi-modal, parallel-batch |
 | `/budget-check <plan>` | Pre-flight: does this plan fit in the remaining 5h window? Returns ✅ / ⚠️ / ❌ with concrete options |
 | `/execute-at-reset <plan>` | Schedule a plan to auto-execute ~1 min after the next 5h reset (via Claude Code's `CronCreate`) |
+| `/burn` | Burn-rate posture: is there surplus 5h budget that will expire unused, or should you conserve? Reports SPRINT / SPEND / NORMAL / CONSERVE / CRITICAL |
 | `/agents` | Live view of native Claude subagents (Agent/Task tool) — running vs done, each one's task, duration, and a completion count. Reads the subagent transcripts Claude Code maintains, so it works across sessions and even when rate-limited |
 
 ## Hooks
 
 | Hook | Event | What it does |
 |---|---|---|
+| `burn-rate-advisor.js` | `UserPromptSubmit` + `PreToolUse (Agent\|Workflow)` | Grades **budget left vs clock left** (`surplus = budget_left% − clock_left%`). 5h budget does not roll over, so when the window is about to reset with a lot unspent it says **SPRINT** — fan out to maximum useful width, breadth over depth, push mechanical work to external CLI executors. When burning faster than the clock it says **CONSERVE**/**CRITICAL** — sequential, cheapest tier, checkpoint and chain to the next window. **Silent when on pace**, and silent at the fan-out decision point unless the posture is actionable. A high 7d reading tempers or cancels a sprint, since the weekly window does not refill. |
 | `auto-budget-check.js` | `UserPromptSubmit` | Scans each prompt for execution-intent keywords (execute, implement, deploy, refactor…). If matched AND 5h usage ≥40%, injects a `[auto-budget]` advisory into the context so Claude sees it before starting. Escalates to 🚨 at ≥80%. |
 | `weekly-maintenance.js` | `SessionStart` | Once per 7 days, rotates dispatch logs older than 30 days and refreshes the Gemini model cache. Runs in background (`child.unref()`) so session startup is never blocked. |
 | `ruflo-model-enforcer.js` | `PreToolUse` (Agent) | Optional. See below. |
