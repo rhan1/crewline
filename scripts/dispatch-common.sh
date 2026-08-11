@@ -24,6 +24,8 @@ dc_write_last_json() {
     MODEL="${MODEL:-}" REASONING="${REASONING:-}" \
     CHARS_OUT="${CHARS_OUT:-}" ATTACHMENT_COUNT="${ATTACHMENT_COUNT:-}" \
     EXECUTOR_USED="${EXECUTOR_USED:-}" \
+    MUTATED="${MUTATED:-}" MUTATED_COUNT="${MUTATED_COUNT:-}" \
+    MUTATION_ACTION="${MUTATION_ACTION:-}" \
     python3 - > "$tmp" <<'PY'
 import json
 import os
@@ -38,6 +40,9 @@ if kind == "codex":
         "reasoning_effort": os.environ.get("REASONING", "none"),
         "tokens":           int(os.environ.get("TOKENS") or 0),
         "elapsed_s":        int(os.environ.get("ELAPSED") or 0),
+        "mutated":          os.environ.get("MUTATED") == "1",
+        "mutated_count":    int(os.environ.get("MUTATED_COUNT") or 0),
+        "mutation_action":  os.environ.get("MUTATION_ACTION") or "none",
         "status":           os.environ.get("STATUS", "unknown"),
         "status_detail":    os.environ.get("STATUS_DETAIL", ""),
         "exit_code":        int(os.environ.get("EXIT_CODE") or 0),
@@ -167,4 +172,69 @@ dc_elapsed() {
   local end_epoch="${2:-$(dc_now)}"
 
   printf '%s\n' "$(( end_epoch - start_epoch ))"
+}
+
+# ── Working-tree mutation detection ──────────────────────────────────────────
+# An external executor can silently write files during a run you believed was
+# read-only (a "review this" or "analyse that" dispatch). Exit 0 + plausible
+# prose tells you nothing about whether the tree moved. These snapshot the tree
+# before the call and diff after, so every dispatch reports what it touched.
+#
+# Detection is ALWAYS on and never destructive. Reversion is opt-in per call
+# (dc_tree_revert, gated by the caller on an explicit read-only declaration),
+# because this wrapper is legitimately used FOR builds where writes are the
+# point — auto-reverting those would destroy real work.
+#
+# git-only: `git status --porcelain -uall` covers tracked edits AND untracked
+# new files in one cheap call. Non-git dirs report "nogit" and skip detection
+# rather than walking an arbitrarily large tree.
+
+# dc_tree_snapshot <dir> <outfile> → prints "git" or "nogit"
+dc_tree_snapshot() {
+  local dir="${1:-.}" out="${2:-}"
+  [ -n "$out" ] || return 1
+  : > "$out"
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$dir" status --porcelain -uall > "$out" 2>/dev/null
+    printf 'git\n'
+  else
+    printf 'nogit\n'
+  fi
+}
+
+# dc_tree_changes <before> <after> → prints changed porcelain lines (may be empty)
+dc_tree_changes() {
+  local before="$1" after="$2"
+  [ -f "$before" ] && [ -f "$after" ] || return 0
+  # Lines present after but not before = what this dispatch introduced.
+  LC_ALL=C comm -13 <(LC_ALL=C sort "$before") <(LC_ALL=C sort "$after") 2>/dev/null
+}
+
+# dc_tree_was_clean <snapshotfile> → 0 if the tree had no pending changes
+dc_tree_was_clean() {
+  local snap="$1"
+  [ -f "$snap" ] || return 1
+  [ ! -s "$snap" ]
+}
+
+# dc_tree_revert <dir> <changes> — undo ONLY what this dispatch introduced.
+# Caller must have verified the tree was clean beforehand; otherwise pre-existing
+# work is indistinguishable from executor output and nothing should be touched.
+# Untracked additions are deleted; tracked modifications are checked out.
+dc_tree_revert() {
+  # NB: `status` is a read-only special variable in zsh — never name a local
+  # that, or this function dies the moment the file is sourced by a non-bash shell.
+  local dir="$1" changes="$2" st path
+  [ -n "$changes" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    st="$(printf '%s' "$line" | cut -c1-2)"
+    path="$(printf '%s' "$line" | cut -c4-)"
+    # porcelain quotes paths containing spaces/unicode
+    case "$path" in \"*\") path="$(printf '%s' "$path" | sed 's/^"//; s/"$//')" ;; esac
+    case "$st" in
+      '??') rm -rf -- "$dir/$path" 2>/dev/null ;;
+      *)    git -C "$dir" checkout -- "$path" 2>/dev/null ;;
+    esac
+  done <<< "$changes"
 }

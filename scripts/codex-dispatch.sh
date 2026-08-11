@@ -47,6 +47,15 @@ LAST_JSON="$CLAUDE_DIR/codex-last.json"
 
 START_EPOCH="$(dc_now)"
 
+# Snapshot the tree so we can report afterwards whether this dispatch actually
+# wrote anything (see dispatch-common.sh). Detection is free and always on.
+WORK_DIR="${CODEX_WORK_DIR:-$PWD}"
+TREE_BEFORE="$(mktemp "${TMPDIR:-/tmp}/dispatch-tree-before.XXXXXX")"
+TREE_AFTER="$(mktemp "${TMPDIR:-/tmp}/dispatch-tree-after.XXXXXX")"
+TREE_KIND="$(dc_tree_snapshot "$WORK_DIR" "$TREE_BEFORE")"
+TREE_CLEAN_BEFORE=0
+dc_tree_was_clean "$TREE_BEFORE" && TREE_CLEAN_BEFORE=1
+
 # </dev/null: codex exec blocks forever ("Reading additional input from stdin...")
 # when stdin is an open non-tty pipe (cron/hooks/backgrounded dispatch).
 STALL_TICKS="${CODEX_STALL_MINS:-10}"
@@ -74,6 +83,35 @@ WATCHDOG_STATUS="$(tr -d '\r\n' < "$STATUS_FILE")"
 rm -f "$STATUS_FILE"
 
 ELAPSED="$(dc_elapsed "$START_EPOCH" "$END_EPOCH")"
+
+# ── Did this dispatch touch the tree? ────────────────────────────────────────
+MUTATED=0; MUTATED_COUNT=0; MUTATION_ACTION="none"
+if [ "$TREE_KIND" = "git" ]; then
+  dc_tree_snapshot "$WORK_DIR" "$TREE_AFTER" >/dev/null
+  TREE_CHANGES="$(dc_tree_changes "$TREE_BEFORE" "$TREE_AFTER")"
+  if [ -n "$TREE_CHANGES" ]; then
+    MUTATED=1
+    MUTATED_COUNT="$(printf '%s\n' "$TREE_CHANGES" | grep -c . || true)"
+    {
+      echo ""
+      echo "[Mutation] this dispatch wrote $MUTATED_COUNT path(s) under $WORK_DIR:"
+      printf '%s\n' "$TREE_CHANGES" | sed 's/^/  /'
+    } | tee -a "$LOG_FILE"
+    if [ "${CODEX_EXPECT_READONLY:-0}" = "1" ]; then
+      if [ "$TREE_CLEAN_BEFORE" -eq 1 ]; then
+        dc_tree_revert "$WORK_DIR" "$TREE_CHANGES"
+        MUTATION_ACTION="reverted"
+        echo "[Mutation] CODEX_EXPECT_READONLY=1 — reverted the above (tree was clean before)." | tee -a "$LOG_FILE"
+      else
+        MUTATION_ACTION="kept-dirty-tree"
+        echo "[Mutation] CODEX_EXPECT_READONLY=1 but the tree was ALREADY dirty — refusing to revert; inspect manually." | tee -a "$LOG_FILE"
+      fi
+    else
+      MUTATION_ACTION="kept"
+    fi
+  fi
+fi
+rm -f "$TREE_BEFORE" "$TREE_AFTER"
 
 # Parse "tokens used\nNNN,NNN" block from log (case-insensitive, tolerate commas)
 TOKENS="$(tr -d '\000' < "$LOG_FILE" | LC_ALL=C awk '
