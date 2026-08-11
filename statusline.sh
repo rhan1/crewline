@@ -427,9 +427,13 @@ if [ -n "$cwd" ]; then
 fi
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
-out="${model_part}${SEP}${ctx_part}"
-[ -n "$five_part" ]  && out="${out}${SEP}${five_part}"
+# bg-claude sits right after the model/effort section: it is "what the engine
+# is doing", and placing it between the 5h and 7d bars split the two rate
+# segments visually.
+out="${model_part}"
 [ -n "$cp_run_part" ] && out="${out}${SEP}${cp_run_part}"
+out="${out}${SEP}${ctx_part}"
+[ -n "$five_part" ]  && out="${out}${SEP}${five_part}"
 [ -n "$seven_part" ] && out="${out}${SEP}${seven_part}"
 [ -n "$cache_part" ] && out="${out}${SEP}${cache_part}"
 out="${out}${SEP}${cost_part}"
@@ -639,7 +643,10 @@ else
       nohup "$codex_limits_refresh" </dev/null >/dev/null 2>&1 &
     fi
 
-    codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
+    # No default cap: only render a bar + "/~n" when the operator supplies a
+    # real ceiling. Otherwise show the honest count and invent nothing.
+    codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-}"
+    [[ "$codex_cap_5h" =~ ^[0-9]+$ ]] && [ "$codex_cap_5h" -ge 1 ] || codex_cap_5h=""
     dispatches_5h=0
     total_toks_5h=0
     codex_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
@@ -658,10 +665,14 @@ else
         done
       fi
     fi
-    dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
-    [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
-    dispatch_bar=$(make_bar "$dispatch_pct" 6)
-    dispatch_color=$(pct_color "$dispatch_pct")
+    # Only compute a percentage when a real cap exists — dividing by an unset
+    # cap is an awk syntax error, not a 0.
+    if [ -n "$codex_cap_5h" ]; then
+      dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
+      [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
+      dispatch_bar=$(make_bar "$dispatch_pct" 10)
+      dispatch_color=$(pct_color "$dispatch_pct")
+    fi
     if [ "$total_toks_5h" -ge 1000 ]; then
       toks_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $total_toks_5h/1000}")
     else
@@ -690,7 +701,8 @@ else
         if [ -n "$codex_limit_remaining" ] && [ -n "$codex_limit_clock" ]; then
           codex_limit_text="${codex_limit_text} ${DIM}(${codex_limit_remaining} - ${codex_limit_clock})${RESET}"
         fi
-        codex_limit_segment="$(make_bar "$codex_limit_pct" 6) ${codex_limit_text}"
+        # Width 10 to match row 1's rate bars — a 6-cell bar reads as tiny beside them.
+      codex_limit_segment="$(make_bar "$codex_limit_pct" 10) ${codex_limit_text}"
         if [ -n "$codex_limits_part" ]; then
           codex_limits_part="${codex_limits_part} ${DIM}·${RESET} "
         fi
@@ -700,7 +712,11 @@ else
     if [ -n "$codex_limits_part" ]; then
       codex_part="${codex_part}${SEP}${codex_limits_part}${SEP}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
     else
-      codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+      if [ -n "$codex_cap_5h" ]; then
+        codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+      else
+        codex_part="${codex_part}${SEP}${WHITE}${dispatches_5h}${RESET}${DIM} calls · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+      fi
     fi
 
     codex_json_ts_sec=0
@@ -800,7 +816,9 @@ else
       [ -n "$gemini_model_short" ] && gemini_part="${gemini_part} ${DIM}·${RESET} ${gemini_model_color}${gemini_model_short}${RESET}"
     fi
 
-    gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-100}"
+    # Same rule as the Codex row — no invented ceiling.
+    gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-}"
+    [[ "$gemini_cap_5h" =~ ^[0-9]+$ ]] && [ "$gemini_cap_5h" -ge 1 ] || gemini_cap_5h=""
     gemini_dispatches_5h=0
     gemini_chars_5h=0
     gemini_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
@@ -819,16 +837,22 @@ else
         done
       fi
     fi
-    gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
-    [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
-    gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 6)
-    gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
+    if [ -n "$gemini_cap_5h" ]; then
+      gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
+      [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
+      gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 10)
+      gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
+    fi
     if [ "$gemini_chars_5h" -ge 1000 ]; then
       gemini_chars_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars_5h/1000}")
     else
       gemini_chars_5h_disp="$gemini_chars_5h"
     fi
-    gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+    if [ -n "$gemini_cap_5h" ]; then
+      gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+    else
+      gemini_part="${gemini_part}${SEP}${WHITE}${gemini_dispatches_5h}${RESET}${DIM} calls · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+    fi
 
     gemini_json_ts_sec=0
     if [ -f "$gemini_last_json" ]; then
