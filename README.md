@@ -75,6 +75,7 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `/execute-at-reset <plan>` | Schedule a plan to auto-execute ~1 min after the next 5h reset (via Claude Code's `CronCreate`) |
 | `/burn` | Burn-rate posture: is there surplus 5h budget that will expire unused, or should you conserve? Reports SPRINT / SPEND / NORMAL / CONSERVE / CRITICAL |
 | `/agents` | Live view of native Claude subagents (Agent/Task tool) — running vs done, each one's task, duration, and a completion count. Reads the subagent transcripts Claude Code maintains, so it works across sessions and even when rate-limited |
+| `/balance` | Cross-provider budget health: scores Claude / Codex / Gemini together and says who should take the next job. See **Cross-provider balancing** below |
 
 ## Hooks
 
@@ -84,6 +85,48 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `auto-budget-check.js` | `UserPromptSubmit` | Scans each prompt for execution-intent keywords (execute, implement, deploy, refactor…). If matched AND 5h usage ≥40%, injects a `[auto-budget]` advisory into the context so Claude sees it before starting. Escalates to 🚨 at ≥80%. |
 | `weekly-maintenance.js` | `SessionStart` | Once per 7 days, rotates dispatch logs older than 30 days and refreshes the Gemini model cache. Runs in background (`child.unref()`) so session startup is never blocked. |
 | `ruflo-model-enforcer.js` | `PreToolUse` (Agent) | Optional. See below. |
+| `agy-router.js` | `PreToolUse` (Agent) | Optional. Pushes eligible subagent work onto Antigravity (Gemini) instead of a Claude tier, so it bills the provider you are *not* exhausting. See **Cross-provider balancing** below. |
+
+## Cross-provider balancing
+
+RuFlo answers "which Claude tier?" These two answer the question one level up: **which provider should do this at all?**
+
+### `/balance` and `scripts/quota-balance.mjs`
+
+Reads every provider's quota cache in one place — Claude 5h + 7d, Codex weekly, Gemini/agy 5h + weekly — and scores each on a single signed number:
+
+```
+surplus = (% budget left) − (% of window still to come)
+```
+
+Positive means you are underspending and that budget expires unused at reset. Negative means you are outrunning the refill and will strand yourself mid-week.
+
+Two rules fall out of it, and both exist because of a real failure: one provider hit **100% used with 4.6 days left to reset** while another sat at 0.3% used the entire time.
+
+- **Floor rule** — never drain a provider below ~15% while more than ~40% of its window remains. Flags `⚠ FLOOR`.
+- **Use it or lose it** — a provider in `SPEND` state whose reset is under 24h away should be leaned on hard, not conserved. Applies per provider, not just to the 5h window.
+
+Capability still decides who *can* do a job (no browser driving on agy, no VPN-gated DB from a sandboxed executor). Among those that can, surplus decides who *should*.
+
+### `agy-router.js` + `agents/agy-worker.md`
+
+Unconditional rules like "mechanical work goes to executor X" are what drain a single provider dry. This pair makes the choice conditional and automatic.
+
+`agy-router.js` classifies each `Agent` call and, when the profile is clearly Gemini-eligible, advises routing to the `agy-worker` subagent instead of a Claude tier. Eligible: codebase exploration and file-reading research, mechanical code, batch work, long-context reads, test generation, first-pass drafts. Disqualified: browser driving, VPN/credential-gated data work, MCP-tool tasks, security judgment, anything interactive, and very short asks where writing the spec costs more than doing the work.
+
+`agents/agy-worker.md` is a thin dispatcher subagent: it specs the task, dispatches via `gemini-dispatch.sh`, liveness-checks the log, and — critically — **verifies the deliverable exists and parses before reporting success.** Antigravity has a documented failure mode where it returns a detailed, confident success narrative for a file it never wrote, so "it said it worked" is not evidence.
+
+**Dispatch threshold.** The common ">60 lines" heuristic assumes you are trading one paid quota for another. When the target provider's quota is effectively free, the only cost is spec-writing plus verification, so the threshold drops: dispatch when **the spec is shorter than the work** — roughly 30+ lines of output, 3+ files to read, or any repeated/batch task. Exploration almost always qualifies, since one sentence of spec buys a large pile of reading.
+
+Disable either with `AGY_ROUTER_OFF=1`.
+
+### Model and effort selection
+
+`gemini-dispatch.sh` accepts `AGY_MODEL` and `AGY_EFFORT` (`low|medium|high`, default `high`). Run the strongest tier when the quota is idle — down-tiering a budget you never exhaust saves nothing and only costs quality.
+
+One sharp edge: `--effort` is **rejected** for models with built-in thinking (e.g. `claude-opus-4-6-thinking`). Passing it kills the dispatch in ~5s with no output, which is indistinguishable from a silent no-op. The wrapper suppresses `--effort` for `claude-*` and `gpt-*` models for exactly that reason.
+
+`agy models` lists what your account can reach. Notably it may include Claude-family models — Claude-quality output billed to the Gemini pool.
 
 ### RuFlo (model routing)
 
