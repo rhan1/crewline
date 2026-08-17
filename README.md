@@ -128,6 +128,19 @@ One sharp edge: `--effort` is **rejected** for models with built-in thinking (e.
 
 `agy models` lists what your account can reach. Notably it may include Claude-family models — Claude-quality output billed to the Gemini pool.
 
+### Picking a model: measure, don't assume
+
+A worked example, because the intuitive answer was wrong twice.
+
+A first pass had Gemini 3.7 fail one task where 3.6 passed, which looked like a clear regression. It wasn't reproducible. A powered rerun — 6 trials x 4 tasks x both models, 48 cells — put both at **24/24 correct and 168/180 (93%) on beyond-spec robustness stress cases**, statistically indistinguishable. The single failure never recurred across 30 further attempts.
+
+Two methodology rules came out of it:
+
+1. **n=1 is not a verdict.** Run at least 3 trials before recording any model comparison.
+2. **Give the incumbent equal attempts.** The challenger had been run 4x and the incumbent once, so "the incumbent is perfect" was equally unsupported.
+
+And a third, about the instrument itself: measure quality separately from correctness. A pass/fail grader scores a solution that scrapes through a 5s gate identically to one finishing in 0.2s, and scores one that happens to survive the specified cases identically to one that also handles input nobody mentioned. `quality_probe.py` adds perf headroom, beyond-spec robustness, and structural craft signals for exactly that reason.
+
 ### RuFlo (model routing)
 
 `hooks/ruflo-model-enforcer.js` fires on every `Agent` tool call and rewrites the `model` parameter to the cheapest tier that fits the task. It uses keyword heuristics — no external CLI, no network calls, no LLM inference. The whole thing is ~120 lines of Node.js with no dependencies.
