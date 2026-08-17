@@ -2,6 +2,29 @@
 # Shared helpers for the Codex and Antigravity dispatch wrappers.
 # This file intentionally performs no work when sourced.
 
+# dc_timeout SECS cmd... — run cmd with a hard wall-clock cap.
+# macOS ships no coreutils `timeout`; perl's alarm is always present.
+# Returns the command's exit code, or 142 when the alarm fires.
+dc_timeout() {
+  local secs="${1:-15}"
+  shift || return 2
+  [ "$#" -gt 0 ] || return 2
+  perl -e 'alarm shift; exec @ARGV' -- "$secs" "$@"
+}
+
+# dc_codex_tier_targets TIER — echo "MODEL EFFORT SERVICE_TIER" for a tier name.
+# Single source of truth for the Codex tier table (validated live 2026-07-30:
+# `minimal` effort is rejected by the 5.6 family; supported = none|low|medium|
+# high|xhigh|max, plus `ultra` on sol).
+dc_codex_tier_targets() {
+  case "${1:-}" in
+    lite) printf 'gpt-5.6-luna low flex\n' ;;
+    std)  printf 'gpt-5.6-terra high flex\n' ;;
+    max)  printf 'gpt-5.6-sol high priority\n' ;;   # ultra -> high (Raza, 2026-08-16): quota IS the binding constraint now
+    *)    return 1 ;;
+  esac
+}
+
 dc_write_last_json() {
   local target="${1:-}"
   local summary_kind="${2:-}"
@@ -24,6 +47,8 @@ dc_write_last_json() {
     MODEL="${MODEL:-}" REASONING="${REASONING:-}" \
     CHARS_OUT="${CHARS_OUT:-}" ATTACHMENT_COUNT="${ATTACHMENT_COUNT:-}" \
     EXECUTOR_USED="${EXECUTOR_USED:-}" \
+    TIER="${TIER:-}" ROUTE_SOURCE="${ROUTE_SOURCE:-}" \
+    ROUTE_CX="${ROUTE_CX:-}" SERVICE_TIER="${SERVICE_TIER:-}" \
     MUTATED="${MUTATED:-}" MUTATED_COUNT="${MUTATED_COUNT:-}" \
     MUTATION_ACTION="${MUTATION_ACTION:-}" \
     python3 - > "$tmp" <<'PY'
@@ -38,11 +63,19 @@ if kind == "codex":
         "task_name":        os.environ.get("TASK_NAME", ""),
         "model":            os.environ.get("MODEL", "unknown"),
         "reasoning_effort": os.environ.get("REASONING", "none"),
-        "tokens":           int(os.environ.get("TOKENS") or 0),
-        "elapsed_s":        int(os.environ.get("ELAPSED") or 0),
+        "tier":             os.environ.get("TIER") or "unrouted",
+        "route_source":     os.environ.get("ROUTE_SOURCE") or "none",
+        "route_complexity": int(os.environ.get("ROUTE_CX") or 0),
+        "service_tier":     os.environ.get("SERVICE_TIER") or "default",
+        # Did the dispatch write to the working tree? "kept" = writes left in
+        # place (normal for builds); "reverted" = undone under
+        # CODEX_EXPECT_READONLY; "kept-dirty-tree" = wrote, but the tree was
+        # already dirty so reverting was unsafe — inspect manually.
         "mutated":          os.environ.get("MUTATED") == "1",
         "mutated_count":    int(os.environ.get("MUTATED_COUNT") or 0),
         "mutation_action":  os.environ.get("MUTATION_ACTION") or "none",
+        "tokens":           int(os.environ.get("TOKENS") or 0),
+        "elapsed_s":        int(os.environ.get("ELAPSED") or 0),
         "status":           os.environ.get("STATUS", "unknown"),
         "status_detail":    os.environ.get("STATUS_DETAIL", ""),
         "exit_code":        int(os.environ.get("EXIT_CODE") or 0),
@@ -138,7 +171,12 @@ dc_watchdog_start() {
           "${task_name}: stalled for ${stall_ticks}m; killed"
       fi
     done
-  ) &
+  # >/dev/null 2>&1 is load-bearing, not tidiness: this subshell is disowned and
+  # outlives the dispatch by up to one 60s tick. If it inherits the caller's
+  # stdout, any `$(codex-dispatch.sh ...)` capture blocks on pipe EOF until the
+  # watchdog exits — a ~60s phantom hang per dispatch. The watchdog writes what
+  # it needs directly to $log_file.
+  ) >/dev/null 2>&1 &
   DC_WATCHDOG_PID=$!
   disown -h "$DC_WATCHDOG_PID" 2>/dev/null || true
 }

@@ -1,33 +1,22 @@
 #!/usr/bin/env bash
-# Claude Code status line — shows Claude context/rate-limits, Codex, and
-# Gemini dispatch activity on up to three rows. When ~/.claude/orchestrator-models.json
-# is present (Layer 2), additional model rows are rendered dynamically from that
-# registry (up to 5 total, skipping uninstalled CLIs). Falls back to the
-# original hardcoded Codex + Gemini rows when the registry does not exist.
-# Writes a session-state cache to ~/.claude/.session-state.json that the
-# /budget-check and /execute-at-reset slash commands and the auto-budget-check
-# hook read.
+# Claude Code status line — ~/.claude/statusline.sh
 
 input=$(cat)
-
-# ── Live-process snapshot (one ps; bracket-trick [x] excludes the grep itself) ─
-# The statusline otherwise shows only COMPLETED dispatches, so a long-running
-# background job — or a headless `claude -p` batch — reads as dead. These detect
-# live processes so active work is visible (see the row code below).
-PS_SNAP=$(ps -axo command 2>/dev/null)
-cp_running=$(printf '%s\n' "$PS_SNAP" | grep -cE '(^|/)[c]laude +(-p|--print)( |$)')
-[[ "$cp_running" =~ ^[0-9]+$ ]] || cp_running=0
 
 # ── Cross-session rate-limit reconciliation (per-session files) ──────────────
 # Rate limits are account-wide, but Claude Code hands each session ONLY its own
 # last-API-response snapshot via stdin — an idle session shows a frozen, often
 # PREVIOUS-window number while a busy one shows the live window, so raw stdin %s
-# disagree across sessions. FIX (race-free): each session writes its snapshot to
-# ~/.claude/.rl/<ppid>.json (own file — no shared-write race); the display
-# reduces across all live files: current window = MAX resets_at; usage = MAX %
-# among sessions in that window. Older-window (stale) sessions are excluded, so a
-# session idle since a past window can't drag the number down. The reconciled
-# values are also written to ~/.claude/.session-state.json for /budget-check etc.
+# disagree across sessions. There is no local API for true account usage.
+#
+# FIX (race-free): each session writes ITS snapshot to ~/.claude/.rl/<ppid>.json
+# (own file — no shared read-modify-write race), and the DISPLAY reduces across
+# ALL live session files: current window = the MAX resets_at seen; usage = MAX %
+# among sessions IN that window (usage only rises within a window). Older-window
+# (stale) sessions are excluded by the max-reset filter, so a session idle since
+# a past window can't drag the number to its stale value. An earlier shared-cache
+# design oscillated because concurrent read-modify-writes let a stale session
+# re-assert its old window; per-session files remove the shared write entirely.
 SESSION_STATE="$HOME/.claude/.session-state.json"
 RL_DIR="$HOME/.claude/.rl"
 mkdir -p "$RL_DIR" 2>/dev/null
@@ -44,10 +33,11 @@ rl_tmp="$RL_DIR/.$PPID.tmp"
 printf '{"ts":%s,"five_pct":%s,"five_reset":%s,"seven_pct":%s,"seven_reset":%s}\n' \
   "$now_epoch" "${in5p:-null}" "${in5r:-null}" "${in7p:-null}" "${in7r:-null}" \
   > "$rl_tmp" 2>/dev/null && mv -f "$rl_tmp" "$RL_DIR/$PPID.json" 2>/dev/null || true
-# drop dead sessions' files (untouched 6h) so they can't skew the reduce
+# drop dead sessions' files (untouched 6h) so they can't skew the reduce / grow unbounded
 find "$RL_DIR" -name '*.json' -mmin +360 -delete 2>/dev/null || true
 
 # reduce across live files: current window = max reset; % = max within 1h of it
+# (resets within RL_TOL count as the same window — covers minor drift, << 5h/7d span)
 RL_TOL=3600
 IFS=$'\t' read -r m5_pct m5_reset m7_pct m7_reset <<< "$(jq -s -r \
   --argjson now "$now_epoch" --argjson tol "$RL_TOL" '
@@ -78,7 +68,7 @@ echo "$input" | jq \
   cwd: (.workspace.current_dir // .cwd // null)
 }' > "$SESSION_STATE" 2>/dev/null || true
 
-# ── Colors (truecolor — bypasses terminal theme remapping) ────────────────────
+# ── Colors (truecolor — bypasses Warp theme remapping) ────────────────────────
 RESET='\033[0m'
 DIM='\033[2m'
 BOLD='\033[1m'
@@ -92,11 +82,6 @@ ORANGE='\033[38;2;230;150;60m'
 SILVER='\033[38;2;200;210;220m'
 CODEX_GREEN='\033[38;2;16;163;127m'
 GEMINI_PURPLE='\033[38;2;156;93;247m'
-
-# Live headless `claude -p` jobs burn account budget but never refresh the 5h bar
-# (no interactive API call), so the bar can read 0% while real Claude work runs.
-cp_run_part=""
-[ "$cp_running" -gt 0 ] && cp_run_part="${CYAN}${BOLD}${cp_running} bg-claude${RESET}${DIM} running${RESET}"
 
 SEP="${GRAY} | ${RESET}"
 
@@ -224,9 +209,129 @@ reset_clock() {
   date -j -f "%s" "$target_sec" "+%H:%M" 2>/dev/null
 }
 
+# ── Unified external-LLM ledger: 5h aggregation (single jq pass) ─────────────
+# Direct agy/codex binary calls (via the ~/.claude/shims PATH shims) and headless
+# claude -p calls (via llm-tick) append to ~/.claude/llm-calls.jsonl, so the
+# statusline reflects offloaded work that bypassed the dispatch wrappers.
+# Full-file read (weekly-maintenance prunes to 5000 lines, so it's bounded):
+# a tail window could scroll past a tool's newest entry and re-stale `last:`.
+# Malformed lines are skipped. Runs BEFORE row 1 so claude -p cost shows there.
+led_codex_n=0; led_agy_n=0; led_cp_n=0; led_cp_cost=0
+led_codex_last_ts=0; led_agy_last_ts=0   # newest ledger ts per tool (for `last:`)
+LEDGER_FILE="$HOME/.claude/llm-calls.jsonl"
+if [ -f "$LEDGER_FILE" ]; then
+  led_cut=$(date -u -v-5H +%s 2>/dev/null)
+  if [ -n "$led_cut" ]; then
+    led_agg=$(jq -rRn --argjson cut "$led_cut" '
+      [inputs | fromjson?] as $all |
+      ($all | map(select(.ts >= $cut))) as $e |
+      [ ($e | map(select(.tool=="codex"))    | length),
+        ($e | map(select(.tool=="agy"))      | length),
+        ($e | map(select(.tool=="claude-p")) | length),
+        ($e | map(select(.tool=="claude-p") | .cost_usd) | add // 0),
+        ($all | map(select(.tool=="codex") | .ts) | max // 0),
+        ($all | map(select(.tool=="agy")   | .ts) | max // 0)
+      ] | @tsv' "$LEDGER_FILE" 2>/dev/null)
+    [ -n "$led_agg" ] && IFS=$'\t' read -r led_codex_n led_agy_n led_cp_n led_cp_cost led_codex_last_ts led_agy_last_ts <<< "$led_agg"
+  fi
+fi
+# normalize (empty/non-numeric → 0) so arithmetic + tests can't error
+[[ "$led_codex_n" =~ ^[0-9]+$ ]] || led_codex_n=0
+[[ "$led_agy_n"   =~ ^[0-9]+$ ]] || led_agy_n=0
+[[ "$led_cp_n"    =~ ^[0-9]+$ ]] || led_cp_n=0
+[[ "$led_cp_cost" =~ ^[0-9]*\.?[0-9]+$ ]] || led_cp_cost=0
+[[ "$led_codex_last_ts" =~ ^[0-9]+$ ]] || led_codex_last_ts=0
+[[ "$led_agy_last_ts"   =~ ^[0-9]+$ ]] || led_agy_last_ts=0
+
+# Compact claude -p 5h-cost segment for row 1 (only when there's headless spend).
+cp_main_part=""
+if [ "$led_cp_n" -gt 0 ]; then
+  cp_main_disp=$(awk "BEGIN{printf \"%.2f\", $led_cp_cost}")
+  cp_main_part="${YELLOW}cp:${RESET}${WHITE}\$${cp_main_disp}${RESET}"
+fi
+
+# Live counts of background executor processes (one read-only `ps` snapshot;
+# bracket-trick `[x]` excludes the grep itself). The statusline otherwise shows
+# only COMPLETED dispatches (a 5h count + a "last:" timestamp), so a long-running
+# background job reads as dead — e.g. a Codex wrapper run only writes
+# codex-last.json on COMPLETION, so its row shows a stale "last:" the whole time
+# it's working. These live counts surface that the executors are actually alive.
+PS_SNAP=$(ps -axo command 2>/dev/null)
+# headless `claude -p` jobs (burn Claude budget but never refresh the 5h bar)
+cp_running=$(printf '%s\n' "$PS_SNAP" | grep -cE '(^|/)[c]laude +(-p|--print)( |$)')
+[[ "$cp_running" =~ ^[0-9]+$ ]] || cp_running=0
+cp_run_part=""
+[ "$cp_running" -gt 0 ] && cp_run_part="${CYAN}${BOLD}${cp_running} bg-claude${RESET}${DIM} running${RESET}"
+# app-server excluded ANYWHERE in the line (not just adjacent `codex app-server`):
+# ChatGPT.app runs an embedded `codex -c <flags> app-server` that otherwise
+# lights `running now` permanently (caught 2026-07-22).
+codex_live=$(printf '%s\n' "$PS_SNAP" | awk '/(^|\/)codex( |$)/ && $0 !~ /app-server/ { count++ } END { print count + 0 }')
+[[ "$codex_live" =~ ^[0-9]+$ ]] || codex_live=0
+agy_live=$(printf '%s\n' "$PS_SNAP" | grep -cE '(^|/)[a]gy ')
+[[ "$agy_live" =~ ^[0-9]+$ ]] || agy_live=0
+
+# ── RuFlo status (last routing decision within 10 min) ───────────────────────
+# Computed before the model segment because it renders INSIDE it (subagent model
+# sits next to the main model, mirroring the codex row's `codex plus · <model>`).
+# State file format:  "<ISO_TS> <ACTION> <chosen>-><final> conf=<pct>"
+#   ACTION = REWRITE (RuFlo changed the model) | AGREE (RuFlo confirmed) | PASSTHRU
+ruflo_part=""
+if command -v ruflo >/dev/null 2>&1; then
+  ruflo_state="$HOME/.claude/hooks/ruflo-last-route.txt"
+  if [ -f "$ruflo_state" ]; then
+    line=$(tail -1 "$ruflo_state" 2>/dev/null)
+    if [ -n "$line" ]; then
+      ts=$(echo "$line" | awk '{print $1}' | sed 's/\..*//')
+      action=$(echo "$line" | awk '{print $2}')
+      route=$(echo "$line" | awk '{print $3}')  # chosen->final
+      chosen=${route%%-*}
+      final=${route##*>}
+      ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$ts" +%s 2>/dev/null)
+      if [ -n "$ts_sec" ]; then
+        now_sec=$(date -u +%s)
+        age_sec=$((now_sec - ts_sec))
+        if [ "$age_sec" -ge 0 ] && [ "$age_sec" -lt 600 ]; then
+          if   [ "$age_sec" -lt 60 ]; then age_str="now"
+          else age_str="$((age_sec / 60))m"
+          fi
+          case "$action" in
+            REWRITE)
+              # Rewrite: opus→sonnet in yellow
+              ruflo_part="${YELLOW}${chosen}→${final}${RESET} ${DIM}${age_str}${RESET}"
+              ;;
+            AGREE)
+              # Agree: just final model in cyan
+              ruflo_part="${CYAN}${final}${RESET} ${DIM}${age_str}${RESET}"
+              ;;
+            # PASSTHRU: stays empty — nothing useful to display
+          esac
+        fi
+      fi
+    fi
+  fi
+fi
+
 # ── Model ─────────────────────────────────────────────────────────────────────
 model_name=$(echo "$input" | jq -r '.model.display_name // "Unknown"')
+# Drop the "(1M context)" parenthetical — the context bar already shows this.
+model_name=$(printf '%s' "$model_name" | sed -E 's/ *\([^)]*[Cc]ontext[^)]*\)//')
 model_part="${ORANGE}${BOLD}${model_name}${RESET}"
+
+# Subagent route rides next to the main model: "Opus 5 · sonnet 4m · xhigh"
+[ -n "$ruflo_part" ] && model_part="${model_part} ${DIM}·${RESET} ${ruflo_part}"
+
+# Effort pill — persisted effortLevel from settings.json (--effort/env can override
+# per session; settings is the durable source). Warmer = higher spend.
+effort=$(jq -r '.effortLevel // empty' "$HOME/.claude/settings.json" 2>/dev/null)
+if [ -n "$effort" ] && [ "$effort" != "null" ]; then
+  case "$effort" in
+    max)   eff_col='\033[1m\033[38;2;255;140;90m' ;;  # bold warm-orange: max spend
+    xhigh) eff_col="$ORANGE" ;;
+    high)  eff_col="$YELLOW" ;;
+    *)     eff_col="${DIM}${WHITE}" ;;
+  esac
+  model_part="${model_part} ${DIM}·${RESET} ${eff_col}${effort}${RESET}"
+fi
 
 # ── Context usage + bar (+ auto-compact warning at 80%) ───────────────────────
 ctx_pct=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
@@ -250,7 +355,8 @@ if [ -n "$m5_pct" ] && [ -n "$m5_reset" ]; then
     five_int=$m5_pct
   fi
   if [ "$five_int" -ge 100 ]; then
-    # at/over budget: bar maxes out, real number bold-red (cap throttles, not a hard block)
+    # at/over budget: bar maxes out, real number in bold red. NOT a hard block —
+    # the cap throttles/tolerates overage, so Claude often keeps operating.
     five_bar=$(make_bar 100 10); five_color="${BOLD}${RED}"
   else
     five_bar=$(make_bar "$five_int" 10); five_color=$(pct_color "$five_int")
@@ -270,11 +376,7 @@ else
 fi
 
 # ── Weekly rate limit + bar + reset countdown ────────────────────────────────
-seven_pct=$(echo "$input" | jq -r '
-  .rate_limits.weekly.used_percentage //
-  .rate_limits.seven_day.used_percentage //
-  empty
-')
+# Renders the reconciled m7_* values (shared across sessions).
 if [ -n "$m7_pct" ] && [ -n "$m7_reset" ]; then
   now7=$(date -u +%s)
   if [ "$now7" -ge "$m7_reset" ]; then
@@ -329,7 +431,7 @@ if [ "$input_total" -gt 0 ] && [ "$cache_read" -gt 0 ]; then
   cache_part="${DIM}cache:${RESET}${cache_color}${cache_pct}%${RESET} ${DIM}(saved \$${saved})${RESET}"
 fi
 
-# ── Cost ──────────────────────────────────────────────────────────────────────
+# ── Cost + burn rate ──────────────────────────────────────────────────────────
 cost_usd=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 cost=$(awk "BEGIN{printf \"%.2f\", $cost_usd}")
 cost_part="${DIM}\$${cost}${RESET}"
@@ -344,6 +446,14 @@ elapsed_ms=$(echo "$input" | jq -r '
 elapsed_min=$(awk "BEGIN{printf \"%d\", $elapsed_ms/60000}")
 elapsed_part="${DIM}${elapsed_min}m${RESET}"
 
+# Burn rate ($/hr) — needs >=1 minute elapsed to be meaningful
+if [ "$elapsed_min" -gt 0 ]; then
+  burn=$(awk "BEGIN{printf \"%.2f\", ($cost_usd/$elapsed_min)*60}")
+  burn_part="${DIM}\$${burn}/hr${RESET}"
+else
+  burn_part=""
+fi
+
 # ── Git branch (with dirty flag) or project basename fallback ─────────────────
 cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
 branch=""
@@ -352,7 +462,7 @@ loc_part=""
 if [ -n "$cwd" ]; then
   branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null)
   if [ -n "$branch" ]; then
-    # Parse GitHub owner from origin remote (disambiguates multiple git accounts)
+    # Parse GitHub owner from origin remote (disambiguates rhan1 vs razakhanLL)
     remote_url=$(git -C "$cwd" --no-optional-locks config --get remote.origin.url 2>/dev/null)
     owner=""
     if [ -n "$remote_url" ]; then
@@ -362,26 +472,7 @@ if [ -n "$cwd" ]; then
       owner="${owner##*:}"
     fi
 
-    # Only display @owner if it matches one of the user's locally-authenticated
-    # gh accounts. Without this check, anyone who clones someone else's repo
-    # would see that owner's handle in their statusline.
-    is_my_account=0
-    if [ -n "$owner" ] && command -v gh >/dev/null 2>&1; then
-      gh_accounts_cache="$HOME/.claude/.gh-accounts-cache"
-      cache_age=99999
-      if [ -f "$gh_accounts_cache" ]; then
-        cache_mtime=$(stat -f %m "$gh_accounts_cache" 2>/dev/null || stat -c %Y "$gh_accounts_cache" 2>/dev/null || echo 0)
-        cache_age=$(( $(date +%s) - cache_mtime ))
-      fi
-      if [ ! -f "$gh_accounts_cache" ] || [ "$cache_age" -gt 3600 ]; then
-        gh auth status 2>&1 | sed -nE 's/.*Logged in to github\.com account ([^ ]+).*/\1/p' > "$gh_accounts_cache" 2>/dev/null || true
-      fi
-      if [ -f "$gh_accounts_cache" ] && grep -Fxq "$owner" "$gh_accounts_cache" 2>/dev/null; then
-        is_my_account=1
-      fi
-    fi
-
-    if [ -n "$owner" ] && [ "$is_my_account" = "1" ]; then
+    if [ -n "$owner" ]; then
       # Color by sync state:
       #   green  = clean + synced     yellow = dirty (uncommitted)
       #   orange = ahead (push)       cyan   = behind (pull)
@@ -427,9 +518,9 @@ if [ -n "$cwd" ]; then
 fi
 
 # ── Assemble ──────────────────────────────────────────────────────────────────
-# bg-claude sits right after the model/effort section: it is "what the engine
-# is doing", and placing it between the 5h and 7d bars split the two rate
-# segments visually.
+# bg-claude sits right after the model/effort section (Raza 2026-08-04): it's
+# "what the engine is doing", and putting it between the 5h and 7d bars split
+# the two rate segments visually.
 out="${model_part}"
 [ -n "$cp_run_part" ] && out="${out}${SEP}${cp_run_part}"
 out="${out}${SEP}${ctx_part}"
@@ -437,487 +528,398 @@ out="${out}${SEP}${ctx_part}"
 [ -n "$seven_part" ] && out="${out}${SEP}${seven_part}"
 [ -n "$cache_part" ] && out="${out}${SEP}${cache_part}"
 out="${out}${SEP}${cost_part}"
-out="${out}${SEP}${elapsed_part}"
+[ -n "$cp_main_part" ] && out="${out}${SEP}${cp_main_part}"
 [ -n "$loc_part" ]   && out="${out}${SEP}${loc_part}"
 
-# ── Dispatch rows (rows 2–N) ──────────────────────────────────────────────────
-#
-# Two rendering paths:
-#
-#   REGISTRY PATH  — ~/.claude/orchestrator-models.json exists.
-#                    Iterate models[], skip CLIs not on PATH, cap at 5 rows,
-#                    render a lean row per model using the registry's color,
-#                    display_name, model_label, rate_limit_5h, and last_file.
-#
-#   FALLBACK PATH  — registry absent. Render the original hardcoded Codex +
-#                    Gemini rows so existing installs keep working with no
-#                    config migration required.
-#
-# The two paths are mutually exclusive. Registry wins when the file exists.
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Codex dispatch line (second row) ─────────────────────────────────────────
+codex_line=""
+codex_auth_cache="$HOME/.claude/codex-auth-cache.txt"
+codex_last_json="$HOME/.claude/codex-last.json"
+codex_auth_src="$HOME/.codex/auth.json"
+codex_refresh="$HOME/.claude/scripts/codex-refresh-auth-cache.sh"
+codex_limits_cache="$HOME/.claude/codex-rate-limits.json"
+codex_limits_refresh="$HOME/.claude/scripts/codex-rate-limits-refresh.mjs"
+codex_limits_fresh=0
 
-REGISTRY="$HOME/.claude/orchestrator-models.json"
+if [ -f "$codex_limits_cache" ]; then
+  codex_limits_mtime=$(stat -f "%m" "$codex_limits_cache" 2>/dev/null)
+  if [[ "$codex_limits_mtime" =~ ^[0-9]+$ ]] && [ "$((now_epoch - codex_limits_mtime))" -lt 60 ]; then
+    codex_limits_fresh=1
+  fi
+fi
 
-if [ -f "$REGISTRY" ] && jq empty "$REGISTRY" 2>/dev/null; then
+if [ "$codex_limits_fresh" -eq 0 ] && [ -x "$codex_limits_refresh" ]; then
+  nohup "$codex_limits_refresh" </dev/null >/dev/null 2>&1 &
+fi
 
-  # ── REGISTRY PATH ────────────────────────────────────────────────────────
-  # Read all model IDs into a newline-separated list (Bash 3.2 compat — no
-  # associative arrays; query each field individually per model index).
-  model_ids="$(jq -r '.models[].id' "$REGISTRY" 2>/dev/null)"
-  row_count=0
-  now_sec=$(date -u +%s)
+# Lazy refresh: regenerate cache when auth.json is newer or cache missing.
+if [ -f "$codex_auth_src" ] && [ -x "$codex_refresh" ]; then
+  if [ ! -f "$codex_auth_cache" ] || [ "$codex_auth_src" -nt "$codex_auth_cache" ]; then
+    "$codex_refresh" >/dev/null 2>&1 || true
+  fi
+fi
 
-  while IFS= read -r mid; do
-    [ -z "$mid" ] && continue
-    [ "$row_count" -ge 5 ] && break
+if [ -f "$codex_auth_cache" ]; then
+  codex_email=""; codex_plan=""; codex_org=""
+  IFS='|' read -r codex_email codex_plan codex_org < "$codex_auth_cache" || true
 
-    # Per-model fields
-    m_command="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .command' "$REGISTRY" 2>/dev/null)"
-    m_display="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .display_name // .id' "$REGISTRY" 2>/dev/null)"
-    m_label="$(jq -r --arg id "$mid"  '.models[] | select(.id==$id) | .model_label // ""' "$REGISTRY" 2>/dev/null)"
-    m_cap="$(jq -r --arg id "$mid"    '.models[] | select(.id==$id) | .rate_limit_5h // ""' "$REGISTRY" 2>/dev/null)"
-    m_color_hex="$(jq -r --arg id "$mid" '.models[] | select(.id==$id) | .color // ""' "$REGISTRY" 2>/dev/null)"
-    m_last_raw="$(jq -r --arg id "$mid"  '.models[] | select(.id==$id) | .last_file' "$REGISTRY" 2>/dev/null)"
-
-    # Skip if CLI not on PATH
-    command -v "$m_command" >/dev/null 2>&1 || continue
-
-    # Expand ~ in last_file path
-    m_last="${m_last_raw/#\~/$HOME}"
-
-    # Build ANSI color from hex (#rrggbb) or fall back to white
-    m_ansi="${WHITE}"
-    if [ -n "$m_color_hex" ] && [ "$m_color_hex" != "null" ]; then
-      hex="${m_color_hex#\#}"
-      if [ "${#hex}" -eq 6 ]; then
-        r_val=$((16#${hex:0:2}))
-        g_val=$((16#${hex:2:2}))
-        b_val=$((16#${hex:4:2}))
-        m_ansi="\033[38;2;${r_val};${g_val};${b_val}m"
+  case "$codex_email" in
+    ""|unknown|missing|error)
+      # Only surface identity when something is wrong
+      codex_part="${CODEX_GREEN}${BOLD}codex${RESET}${SEP}${RED}✗ not logged in${RESET}"
+      ;;
+    *)
+      # Authed state — codex + plan rendered as single bold teal blob.
+      codex_part="${CODEX_GREEN}${BOLD}codex${RESET}"
+      if [ -n "$codex_plan" ] && [ "$codex_plan" != "unknown" ] && [ "$codex_plan" != "none" ]; then
+        codex_part="${CODEX_GREEN}${BOLD}codex ${codex_plan}${RESET}"
       fi
-    fi
 
-    # Label: display_name + optional model_label
-    m_part="${m_ansi}${BOLD}${m_display}${RESET}"
-    if [ -n "$m_label" ] && [ "$m_label" != "null" ]; then
-      m_part="${m_part} ${DIM}·${RESET} ${DIM}${m_label}${RESET}"
-    fi
+      # Append active model. Prefer the model recorded on the last dispatch
+      # (captures overrides); fall back to config.toml default.
+      codex_model=""
+      if [ -f "$codex_last_json" ]; then
+        codex_model=$(jq -r '.model // empty' "$codex_last_json" 2>/dev/null)
+      fi
+      if [ -z "$codex_model" ] || [ "$codex_model" = "unknown" ]; then
+        codex_model=$(grep -m1 -E '^model[[:space:]]*=' "$HOME/.codex/config.toml" 2>/dev/null | sed 's/.*= *"//; s/".*//')
+      fi
+      if [ -n "$codex_model" ]; then
+        # Color the model cyan when a dispatch ran in the last 10 min
+        # (activation indicator — same rule as RuFlo and age), dim otherwise.
+        codex_model_color="${DIM}"
+        if [ -f "$codex_last_json" ]; then
+          ct=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
+          if [ -n "$ct" ]; then
+            cts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ct" +%s 2>/dev/null)
+            if [ -n "$cts" ] && [ "$(( $(date -u +%s) - cts ))" -lt 600 ]; then
+              codex_model_color="${CYAN}"
+            fi
+          fi
+        fi
+        codex_part="${codex_part} ${DIM}·${RESET} ${codex_model_color}${codex_model}${RESET}"
 
-    # 5h dispatch bar — log file prefix is llm-dispatch-<id>- for generic,
-    # or <id>- for the legacy codex/gemini scripts. Count both.
-    dispatches_5h=0
+        # Reasoning-effort indicator — only when elevated (skip "none" default).
+        # Colored yellow to signal "this run used extra compute."
+        if [ -f "$codex_last_json" ]; then
+          codex_reasoning=$(jq -r '.reasoning_effort // "none"' "$codex_last_json" 2>/dev/null)
+          if [ -n "$codex_reasoning" ] && [ "$codex_reasoning" != "none" ] && [ "$codex_reasoning" != "null" ]; then
+            codex_part="${codex_part} ${YELLOW}r:${codex_reasoning}${RESET}"
+          fi
+        fi
+      fi
+      ;;
+  esac
+
+  # Dispatches per rolling 5h window (ChatGPT Plus limits usage by messages,
+  # not tokens — Plus = 20–100/5h on GPT-5.4. Default cap=50 (midpoint);
+  # override via CODEX_DISPATCH_CAP_5H env var.
+  codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-50}"
+  [[ "$codex_cap_5h" =~ ^[0-9]+$ ]] && [ "$codex_cap_5h" -ge 1 ] || codex_cap_5h=50   # 0/garbage → div-by-zero in awk
+  dispatches_5h=0
+  total_toks_5h=0
+  codex_log_ts=0   # newest real-dispatch log mtime — ground truth for "last ran"
+  if [ -d "$HOME/.claude/logs" ]; then
     cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
-    if [ -n "$cutoff_5h" ] && [ -d "$HOME/.claude/logs" ]; then
-      for f in "$HOME/.claude/logs/${mid}"-*.log \
-               "$HOME/.claude/logs/llm-dispatch-${mid}"-*.log; do
+    if [ -n "$cutoff_5h" ]; then
+      for f in "$HOME"/.claude/logs/codex-*.log; do
         [ -f "$f" ] || continue
-        fm=$(stat -f "%m" "$f" 2>/dev/null)
-        [ -n "$fm" ] && [ "$fm" -ge "$cutoff_5h" ] && dispatches_5h=$((dispatches_5h+1))
+        case "$f" in *codex-56-*) continue ;; esac   # skip the GPT-5.6 watcher's own logs
+        m=$(stat -f "%m" "$f" 2>/dev/null)
+        if [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge "$cutoff_5h" ]; then
+          dispatches_5h=$((dispatches_5h+1))
+          [ "$m" -gt "$codex_log_ts" ] && codex_log_ts=$m
+          # -a: a codex log can contain binary bytes — without it grep emits
+          # "Binary file … matches", which then lands in the arithmetic below and
+          # aborts the whole codex block (row silently disappears).
+          t=$(grep -a -oE 'tokens=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)
+          [[ "$t" =~ ^[0-9]+$ ]] && total_toks_5h=$((total_toks_5h + t))
+        fi
       done
     fi
-
-    if [ -n "$m_cap" ] && [ "$m_cap" != "null" ] && [ "$m_cap" -gt 0 ] 2>/dev/null; then
-      d_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$m_cap)*100 + 0.5}")
-      [ "$d_pct" -gt 100 ] && d_pct=100
-      d_bar=$(make_bar "$d_pct" 6)
-      d_color=$(pct_color "$d_pct")
-      m_part="${m_part}${SEP}${d_bar} ${d_color}${dispatches_5h}${RESET}${DIM}/~${m_cap} (5h)${RESET}"
-    else
-      m_part="${m_part}${SEP}${DIM}${dispatches_5h} dispatches (5h)${RESET}"
-    fi
-
-    # Last dispatch info from last_file
-    if [ -f "$m_last" ]; then
-      m_ts="$(jq -r '.timestamp // empty' "$m_last" 2>/dev/null)"
-      m_elapsed="$(jq -r '.elapsed_s // 0' "$m_last" 2>/dev/null)"
-      m_status="$(jq -r '.status // "unknown"' "$m_last" 2>/dev/null)"
-      m_task="$(jq -r '.task_name // empty' "$m_last" 2>/dev/null)"
-
-      if [ -n "$m_ts" ]; then
-        m_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$m_ts" +%s 2>/dev/null)
-        if [ -n "$m_ts_sec" ]; then
-          m_age_sec=$((now_sec - m_ts_sec))
-          if   [ "$m_age_sec" -lt 60 ];    then m_age_str="${m_age_sec}s ago"
-          elif [ "$m_age_sec" -lt 3600 ];  then m_age_str="$((m_age_sec / 60))m ago"
-          elif [ "$m_age_sec" -lt 86400 ]; then m_age_str="$((m_age_sec / 3600))h ago"
-          else m_age_str="$((m_age_sec / 86400))d ago"
-          fi
-          if [ "$m_age_sec" -lt 600 ]; then m_age_color="${CYAN}"; else m_age_color="${DIM}"; fi
-          m_status_color="${WHITE}"
-          [ "$m_status" = "failed" ] && m_status_color="${RED}"
-          m_task_str=""
-          [ -n "$m_task" ] && m_task_str="${WHITE}${m_task}${RESET}${DIM} · ${RESET}"
-          m_part="${m_part}${SEP}${DIM}last:${RESET} ${m_task_str}${m_age_color}${m_age_str}${RESET}${DIM} · ${m_elapsed}s${RESET}"
-        fi
-      fi
-    else
-      m_part="${m_part}${SEP}${DIM}no dispatches yet${RESET}"
-    fi
-
-    # live: this model's CLI is actively running a dispatch right now (a long job
-    # leaves "last:" stale until it finishes — show that it's alive instead)
-    if printf '%s\n' "$PS_SNAP" | grep -qE "(^|/)${m_command}( |\$)|${m_command} +exec"; then
-      m_part="${m_part}${SEP}${GREEN}${BOLD}running now${RESET}"
-    fi
-    out="${out}\n${m_part}"
-    row_count=$((row_count + 1))
-  done <<EOF
-$model_ids
-EOF
-
-else
-
-  # ── FALLBACK PATH — original hardcoded Codex + Gemini rows ───────────────
-  # Preserved verbatim so installs without orchestrator-models.json are unaffected.
-
-  codex_line=""
-  codex_auth_cache="$HOME/.claude/codex-auth-cache.txt"
-  codex_last_json="$HOME/.claude/codex-last.json"
-  codex_auth_src="$HOME/.codex/auth.json"
-  codex_refresh="$HOME/.claude/scripts/codex-refresh-auth-cache.sh"
-
-  # Lazy refresh: regenerate cache when auth.json is newer or cache missing.
-  if [ -f "$codex_auth_src" ] && [ -x "$codex_refresh" ]; then
-    if [ ! -f "$codex_auth_cache" ] || [ "$codex_auth_src" -nt "$codex_auth_cache" ]; then
-      "$codex_refresh" >/dev/null 2>&1 || true
-    fi
   fi
-
-  if [ -f "$codex_auth_cache" ]; then
-    codex_email=""; codex_plan=""; codex_org=""
-    IFS='|' read -r codex_email codex_plan codex_org < "$codex_auth_cache" || true
-
-    case "$codex_email" in
-      ""|unknown|missing|error)
-        codex_part="${CODEX_GREEN}${BOLD}codex${RESET}${SEP}${RED}✗ not logged in${RESET}"
-        ;;
-      *)
-        codex_part="${CODEX_GREEN}${BOLD}codex${RESET}"
-        if [ -n "$codex_plan" ] && [ "$codex_plan" != "unknown" ] && [ "$codex_plan" != "none" ]; then
-          codex_part="${CODEX_GREEN}${BOLD}codex ${codex_plan}${RESET}"
-        fi
-
-        codex_model=""
-        if [ -f "$codex_last_json" ]; then
-          codex_model=$(jq -r '.model // empty' "$codex_last_json" 2>/dev/null)
-        fi
-        if [ -z "$codex_model" ] || [ "$codex_model" = "unknown" ]; then
-          codex_model=$(grep -m1 -E '^model[[:space:]]*=' "$HOME/.codex/config.toml" 2>/dev/null | sed 's/.*= *"//; s/".*//')
-        fi
-        if [ -n "$codex_model" ]; then
-          codex_model_color="${DIM}"
-          if [ -f "$codex_last_json" ]; then
-            ct=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
-            if [ -n "$ct" ]; then
-              cts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ct" +%s 2>/dev/null)
-              if [ -n "$cts" ] && [ "$(( $(date -u +%s) - cts ))" -lt 600 ]; then
-                codex_model_color="${CYAN}"
-              fi
-            fi
-          fi
-          codex_part="${codex_part} ${DIM}·${RESET} ${codex_model_color}${codex_model}${RESET}"
-
-          if [ -f "$codex_last_json" ]; then
-            codex_reasoning=$(jq -r '.reasoning_effort // "none"' "$codex_last_json" 2>/dev/null)
-            if [ -n "$codex_reasoning" ] && [ "$codex_reasoning" != "none" ] && [ "$codex_reasoning" != "null" ]; then
-              codex_part="${codex_part} ${YELLOW}r:${codex_reasoning}${RESET}"
-            fi
-          fi
-        fi
-        ;;
-    esac
-
-    # Real Codex rate limits (primary/secondary windows) via a background
-    # refresher that asks `codex app-server` — replaces the dispatch-count
-    # estimate below whenever the cache is populated.
-    codex_limits_cache="$HOME/.claude/codex-rate-limits.json"
-    codex_limits_refresh="$HOME/.claude/scripts/codex-rate-limits-refresh.mjs"
-    codex_limits_fresh=0
-    if [ -f "$codex_limits_cache" ]; then
-      codex_limits_mtime=$(stat -f "%m" "$codex_limits_cache" 2>/dev/null)
-      if [[ "$codex_limits_mtime" =~ ^[0-9]+$ ]] && [ "$((now_epoch - codex_limits_mtime))" -lt 60 ]; then
-        codex_limits_fresh=1
-      fi
-    fi
-    if [ "$codex_limits_fresh" -eq 0 ] && [ -x "$codex_limits_refresh" ]; then
-      nohup "$codex_limits_refresh" </dev/null >/dev/null 2>&1 &
-    fi
-
-    # No default cap: only render a bar + "/~n" when the operator supplies a
-    # real ceiling. Otherwise show the honest count and invent nothing.
-    codex_cap_5h="${CODEX_DISPATCH_CAP_5H:-}"
-    [[ "$codex_cap_5h" =~ ^[0-9]+$ ]] && [ "$codex_cap_5h" -ge 1 ] || codex_cap_5h=""
-    dispatches_5h=0
-    total_toks_5h=0
-    codex_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
-    if [ -d "$HOME/.claude/logs" ]; then
-      cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
-      if [ -n "$cutoff_5h" ]; then
-        for f in "$HOME"/.claude/logs/codex-*.log; do
-          [ -f "$f" ] || continue
-          m=$(stat -f "%m" "$f" 2>/dev/null)
-          if [ -n "$m" ] && [ "$m" -ge "$cutoff_5h" ]; then
-            dispatches_5h=$((dispatches_5h+1))
-            [ "$m" -gt "$codex_log_ts" ] && codex_log_ts=$m
-            t=$(grep -oE 'tokens=[0-9]+' "$f" 2>/dev/null | tail -1 | cut -d= -f2)
-            [ -n "$t" ] && total_toks_5h=$((total_toks_5h + t))
-          fi
-        done
-      fi
-    fi
-    # Only compute a percentage when a real cap exists — dividing by an unset
-    # cap is an awk syntax error, not a 0.
-    if [ -n "$codex_cap_5h" ]; then
-      dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
-      [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
-      dispatch_bar=$(make_bar "$dispatch_pct" 10)
-      dispatch_color=$(pct_color "$dispatch_pct")
-    fi
-    if [ "$total_toks_5h" -ge 1000 ]; then
-      toks_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $total_toks_5h/1000}")
-    else
-      toks_5h_disp="$total_toks_5h"
-    fi
-    codex_limits_part=""
-    if [ -f "$codex_limits_cache" ]; then
-      while IFS=$'\t' read -r codex_limit_pct codex_limit_minutes codex_limit_reset; do
-        [[ "$codex_limit_pct" =~ ^[0-9]+$ ]] || continue
-        [[ "$codex_limit_minutes" =~ ^[0-9]+$ ]] || continue
-        [[ "$codex_limit_reset" =~ ^[0-9]+$ ]] || continue
-        if [ "$codex_limit_minutes" -ge 1440 ] && [ "$((codex_limit_minutes % 1440))" -eq 0 ]; then
-          codex_limit_label="$((codex_limit_minutes / 1440))d"
-        elif [ "$codex_limit_minutes" -ge 60 ] && [ "$((codex_limit_minutes % 60))" -eq 0 ]; then
-          codex_limit_label="$((codex_limit_minutes / 60))h"
-        else
-          codex_limit_label="${codex_limit_minutes}m"
-        fi
-        codex_limit_window=$((codex_limit_minutes * 60))
-        codex_limit_remaining=$(time_until "$codex_limit_reset" "$codex_limit_window")
-        codex_limit_clock=$(reset_clock "$codex_limit_reset" "$codex_limit_window")
-        # Match the main row's treatment: dim label, gradient % only, RESET
-        # before the dim parens — pct_color must NOT wrap the countdown, or
-        # DIM just stacks faint-green on it instead of gray.
-        codex_limit_text="${DIM}${codex_limit_label}:${RESET}$(pct_color "$codex_limit_pct")${codex_limit_pct}%${RESET}"
-        if [ -n "$codex_limit_remaining" ] && [ -n "$codex_limit_clock" ]; then
-          codex_limit_text="${codex_limit_text} ${DIM}(${codex_limit_remaining} - ${codex_limit_clock})${RESET}"
-        fi
-        # Width 10 to match row 1's rate bars — a 6-cell bar reads as tiny beside them.
-      codex_limit_segment="$(make_bar "$codex_limit_pct" 10) ${codex_limit_text}"
-        if [ -n "$codex_limits_part" ]; then
-          codex_limits_part="${codex_limits_part} ${DIM}·${RESET} "
-        fi
-        codex_limits_part="${codex_limits_part}${codex_limit_segment}"
-      done < <(jq -r '(.rate_limits.primary, .rate_limits.secondary) | select(type == "object") | select((.used_percent | type) == "number" and (.window_duration_mins | type) == "number" and (.resets_at | type) == "number") | [.used_percent, .window_duration_mins, .resets_at] | @tsv' "$codex_limits_cache" 2>/dev/null)
-    fi
-    if [ -n "$codex_limits_part" ]; then
-      codex_part="${codex_part}${SEP}${codex_limits_part}${SEP}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
-    else
-      if [ -n "$codex_cap_5h" ]; then
-        codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+  dispatches_5h=$((dispatches_5h + led_codex_n))   # + direct `codex exec` via shim
+  dispatch_pct=$(awk "BEGIN{printf \"%d\", ($dispatches_5h/$codex_cap_5h)*100 + 0.5}")
+  [ "$dispatch_pct" -gt 100 ] && dispatch_pct=100
+  dispatch_bar=$(make_bar "$dispatch_pct" 6)
+  dispatch_color=$(pct_color "$dispatch_pct")
+  if [ "$total_toks_5h" -ge 1000 ]; then
+    toks_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $total_toks_5h/1000}")
+  else
+    toks_5h_disp="$total_toks_5h"
+  fi
+  codex_limits_part=""
+  if [ -f "$codex_limits_cache" ]; then
+    while IFS=$'\t' read -r codex_limit_pct codex_limit_minutes codex_limit_reset; do
+      [[ "$codex_limit_pct" =~ ^[0-9]+$ ]] || continue
+      [[ "$codex_limit_minutes" =~ ^[0-9]+$ ]] || continue
+      [[ "$codex_limit_reset" =~ ^[0-9]+$ ]] || continue
+      if [ "$codex_limit_minutes" -ge 1440 ] && [ "$((codex_limit_minutes % 1440))" -eq 0 ]; then
+        codex_limit_label="$((codex_limit_minutes / 1440))d"
+      elif [ "$codex_limit_minutes" -ge 60 ] && [ "$((codex_limit_minutes % 60))" -eq 0 ]; then
+        codex_limit_label="$((codex_limit_minutes / 60))h"
       else
-        codex_part="${codex_part}${SEP}${WHITE}${dispatches_5h}${RESET}${DIM} calls · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+        codex_limit_label="${codex_limit_minutes}m"
       fi
-    fi
-
-    codex_json_ts_sec=0
-    if [ -f "$codex_last_json" ]; then
-      cjts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
-      [ -n "$cjts" ] && codex_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$cjts" +%s 2>/dev/null)
-      [[ "$codex_json_ts_sec" =~ ^[0-9]+$ ]] || codex_json_ts_sec=0
-    fi
-    codex_now_sec=$(date -u +%s)
-    codex_live=$(printf '%s\n' "$PS_SNAP" | awk '/(^|\/)codex( |$)/ && $0 !~ /app-server/ { count++ } END { print count + 0 }')
-    if [ "${codex_live:-0}" -gt 0 ]; then
-      # a codex run (exec dispatch OR interactive TUI) is live right now
-      # (last.json updates only on completion). app-server is excluded anywhere
-      # in the line — both the rate-limits refresher's `codex app-server` and
-      # ChatGPT.app's embedded `codex -c ... app-server` (flags in between)
-      # would otherwise light this up permanently.
-      codex_part="${codex_part}${SEP}${GREEN}${BOLD}running now${RESET}"
-    elif [ "${codex_log_ts:-0}" -gt "$codex_json_ts_sec" ]; then
-      # most recent run wrote only a dispatch log (bypassed the wrapper) — use the
-      # log mtime so a recent run isn't shown as a stale days-old "last:"
-      codex_age_sec=$((codex_now_sec - codex_log_ts))
-      if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
-      elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
-      elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
-      else codex_age_str="$((codex_age_sec / 86400))d ago"
+      codex_limit_window=$((codex_limit_minutes * 60))
+      codex_limit_remaining=$(time_until "$codex_limit_reset" "$codex_limit_window")
+      codex_limit_clock=$(reset_clock "$codex_limit_reset" "$codex_limit_window")
+      # Match the main row's treatment (line ~314): dim label, gradient % only,
+      # RESET before the dim parens — pct_color must NOT wrap the countdown, or
+      # DIM just stacks faint-green on it instead of gray.
+      codex_limit_text="${DIM}${codex_limit_label}:${RESET}$(pct_color "$codex_limit_pct")${codex_limit_pct}%${RESET}"
+      if [ -n "$codex_limit_remaining" ] && [ -n "$codex_limit_clock" ]; then
+        codex_limit_text="${codex_limit_text} ${DIM}(${codex_limit_remaining} - ${codex_limit_clock})${RESET}"
       fi
-      codex_age_color="${DIM}"; [ "$codex_age_sec" -lt 600 ] && codex_age_color="${CYAN}"
-      codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_age_color}${codex_age_str}${RESET}${DIM} · ran${RESET}"
-    elif [ -f "$codex_last_json" ]; then
-      codex_ts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
-      codex_tokens=$(jq -r '.tokens // 0' "$codex_last_json" 2>/dev/null)
-      codex_elapsed=$(jq -r '.elapsed_s // 0' "$codex_last_json" 2>/dev/null)
-      codex_status=$(jq -r '.status // "unknown"' "$codex_last_json" 2>/dev/null)
-      codex_task=$(jq -r '.task_name // empty' "$codex_last_json" 2>/dev/null)
-
-      if [ -n "$codex_ts" ]; then
-        codex_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$codex_ts" +%s 2>/dev/null)
-        if [ -n "$codex_ts_sec" ]; then
-          codex_now_sec=$(date -u +%s)
-          codex_age_sec=$((codex_now_sec - codex_ts_sec))
-          if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
-          elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
-          elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
-          else codex_age_str="$((codex_age_sec / 86400))d ago"
-          fi
-
-          if [ "$codex_age_sec" -lt 600 ]; then codex_age_color="${CYAN}"
-          else codex_age_color="${DIM}"
-          fi
-
-          if [ "$codex_tokens" -ge 1000 ]; then
-            codex_tok_disp=$(awk "BEGIN{printf \"%.1fk\", $codex_tokens/1000}")
-          else
-            codex_tok_disp="$codex_tokens"
-          fi
-
-          codex_tok_color="${WHITE}"
-          [ "$codex_status" = "failed" ] && codex_tok_color="${RED}"
-
-          codex_task_str=""
-          [ -n "$codex_task" ] && codex_task_str="${WHITE}${codex_task}${RESET}${DIM} · ${RESET}"
-
-          codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_task_str}${codex_tok_color}${codex_tok_disp}${RESET} ${DIM}toks · ${RESET}${codex_age_color}${codex_age_str}${RESET}${DIM} · ${codex_elapsed}s${RESET}"
-        fi
+      # Width 10 to match row 1's rate bars (Raza 2026-08-04 — the 6-cell bar
+      # read as tiny next to the main 5h/7d bars).
+      codex_limit_segment="$(make_bar "$codex_limit_pct" 10) ${codex_limit_text}"
+      if [ -n "$codex_limits_part" ]; then
+        codex_limits_part="${codex_limits_part} ${DIM}·${RESET} "
       fi
-    else
-      codex_part="${codex_part}${SEP}${DIM}no dispatches yet${RESET}"
-    fi
-
-    codex_line="$codex_part"
+      codex_limits_part="${codex_limits_part}${codex_limit_segment}"
+    done < <(jq -r '(.rate_limits.primary, .rate_limits.secondary) | select(type == "object") | select((.used_percent | type) == "number" and (.window_duration_mins | type) == "number" and (.resets_at | type) == "number") | [.used_percent, .window_duration_mins, .resets_at] | @tsv' "$codex_limits_cache" 2>/dev/null)
+  fi
+  if [ -n "$codex_limits_part" ]; then
+    codex_part="${codex_part}${SEP}${codex_limits_part}${SEP}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
+  else
+    codex_part="${codex_part}${SEP}${dispatch_bar} ${dispatch_color}${dispatches_5h}${RESET}${DIM}/~${codex_cap_5h} · ${RESET}${WHITE}${toks_5h_disp}${RESET}${DIM} toks (5h)${RESET}"
   fi
 
-  [ -n "$codex_line" ] && out="${out}\n${codex_line}"
-
-  # Gemini row
-  gemini_line=""
-  gemini_last_json="$HOME/.claude/gemini-last.json"
-  gemini_creds="$HOME/.gemini/oauth_creds.json"
-
-  if command -v gemini >/dev/null 2>&1 && [ -f "$gemini_creds" ]; then
-    gemini_part="${GEMINI_PURPLE}${BOLD}gemini pro${RESET}"
-
-    gemini_model_cache="$HOME/.claude/gemini-model-cache.txt"
-    if [ -f "$gemini_model_cache" ]; then
-      gemini_model=$(head -1 "$gemini_model_cache" | tr -d '[:space:]')
-      gemini_model_short="${gemini_model#gemini-}"
-      gemini_model_color="${DIM}"
-      if [ -f "$gemini_last_json" ]; then
-        gt=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
-        if [ -n "$gt" ]; then
-          gts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gt" +%s 2>/dev/null)
-          if [ -n "$gts" ] && [ "$(( $(date -u +%s) - gts ))" -lt 600 ]; then
-            gemini_model_color="${CYAN}"
-          fi
-        fi
-      fi
-      [ -n "$gemini_model_short" ] && gemini_part="${gemini_part} ${DIM}·${RESET} ${gemini_model_color}${gemini_model_short}${RESET}"
+  # `last:` reflects the FRESHEST codex signal: the rich wrapper json
+  # (codex-last.json — has task/tokens) OR a bare `codex` call caught by the PATH
+  # shim (ledger — no metadata). The live 5h count is driven by the shim, so
+  # showing the wrapper's stale "4d ago" beside a count of 42 was contradictory.
+  codex_json_ts_sec=0
+  if [ -f "$codex_last_json" ]; then
+    cjts=$(jq -r '.timestamp // empty' "$codex_last_json" 2>/dev/null)
+    [ -n "$cjts" ] && codex_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$cjts" +%s 2>/dev/null)
+    [[ "$codex_json_ts_sec" =~ ^[0-9]+$ ]] || codex_json_ts_sec=0
+  fi
+  codex_now_sec=$(date -u +%s)
+  if [ "${codex_live:-0}" -gt 0 ]; then
+    # a codex dispatch is running RIGHT NOW. The wrapper writes codex-last.json
+    # only on COMPLETION, so "last:" would show a stale (even days-old) entry the
+    # whole time it works — show that it's alive instead.
+    codex_part="${codex_part}${SEP}${GREEN}${BOLD}running now${RESET}"
+  elif [ "${codex_log_ts:-0}" -gt "$codex_json_ts_sec" ] && [ "${codex_log_ts:-0}" -gt "${led_codex_last_ts:-0}" ]; then
+    # most recent codex run wrote only a dispatch log — it bypassed BOTH the
+    # wrapper (which updates codex-last.json) and the shim ledger (e.g. invoked
+    # by absolute path). Use the log mtime so a recent run isn't shown as a stale
+    # days-old "last:".
+    codex_age_sec=$((codex_now_sec - codex_log_ts))
+    if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
+    elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
+    elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
+    else codex_age_str="$((codex_age_sec / 86400))d ago"
     fi
-
-    # Same rule as the Codex row — no invented ceiling.
-    gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-}"
-    [[ "$gemini_cap_5h" =~ ^[0-9]+$ ]] && [ "$gemini_cap_5h" -ge 1 ] || gemini_cap_5h=""
-    gemini_dispatches_5h=0
-    gemini_chars_5h=0
-    gemini_log_ts=0   # newest dispatch-log mtime — ground truth for "last ran"
-    if [ -d "$HOME/.claude/logs" ]; then
-      gemini_cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
-      if [ -n "$gemini_cutoff_5h" ]; then
-        for f in "$HOME"/.claude/logs/gemini-*.log; do
-          [ -f "$f" ] || continue
-          m=$(stat -f "%m" "$f" 2>/dev/null)
-          if [ -n "$m" ] && [ "$m" -ge "$gemini_cutoff_5h" ]; then
-            gemini_dispatches_5h=$((gemini_dispatches_5h+1))
-            [ "$m" -gt "$gemini_log_ts" ] && gemini_log_ts=$m
-            c=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
-            [ -n "$c" ] && gemini_chars_5h=$((gemini_chars_5h + c))
-          fi
-        done
-      fi
+    codex_age_color="${DIM}"; [ "$codex_age_sec" -lt 600 ] && codex_age_color="${CYAN}"
+    codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_age_color}${codex_age_str}${RESET}${DIM} · ran${RESET}"
+  elif [ "$led_codex_last_ts" -gt "$codex_json_ts_sec" ]; then
+    # freshest activity is a bare/direct `codex` call (no task/token metadata)
+    codex_age_sec=$((codex_now_sec - led_codex_last_ts))
+    if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
+    elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
+    elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
+    else codex_age_str="$((codex_age_sec / 86400))d ago"
     fi
-    if [ -n "$gemini_cap_5h" ]; then
-      gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
-      [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
-      gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 10)
-      gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
+    codex_age_color="${DIM}"; [ "$codex_age_sec" -lt 600 ] && codex_age_color="${CYAN}"
+    codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_age_color}${codex_age_str}${RESET}${DIM} · direct call${RESET}"
+  elif [ "$codex_json_ts_sec" -gt 0 ]; then
+    codex_tokens=$(jq -r '.tokens // 0' "$codex_last_json" 2>/dev/null)
+    codex_elapsed=$(jq -r '.elapsed_s // 0' "$codex_last_json" 2>/dev/null)
+    codex_status=$(jq -r '.status // "unknown"' "$codex_last_json" 2>/dev/null)
+    codex_task=$(jq -r '.task_name // empty' "$codex_last_json" 2>/dev/null)
+    codex_age_sec=$((codex_now_sec - codex_json_ts_sec))
+    if   [ "$codex_age_sec" -lt 60 ];    then codex_age_str="${codex_age_sec}s ago"
+    elif [ "$codex_age_sec" -lt 3600 ];  then codex_age_str="$((codex_age_sec / 60))m ago"
+    elif [ "$codex_age_sec" -lt 86400 ]; then codex_age_str="$((codex_age_sec / 3600))h ago"
+    else codex_age_str="$((codex_age_sec / 86400))d ago"
     fi
-    if [ "$gemini_chars_5h" -ge 1000 ]; then
-      gemini_chars_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars_5h/1000}")
-    else
-      gemini_chars_5h_disp="$gemini_chars_5h"
-    fi
-    if [ -n "$gemini_cap_5h" ]; then
-      gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
-    else
-      gemini_part="${gemini_part}${SEP}${WHITE}${gemini_dispatches_5h}${RESET}${DIM} calls · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
-    fi
-
-    gemini_json_ts_sec=0
-    if [ -f "$gemini_last_json" ]; then
-      gjts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
-      [ -n "$gjts" ] && gemini_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gjts" +%s 2>/dev/null)
-      [[ "$gemini_json_ts_sec" =~ ^[0-9]+$ ]] || gemini_json_ts_sec=0
-    fi
-    gemini_now_sec=$(date -u +%s)
-    if printf '%s\n' "$PS_SNAP" | grep -qE '(^|/)[g]emini( |$)'; then
-      gemini_part="${gemini_part}${SEP}${GREEN}${BOLD}running now${RESET}"
-    elif [ "${gemini_log_ts:-0}" -gt "$gemini_json_ts_sec" ]; then
-      gemini_age_sec=$((gemini_now_sec - gemini_log_ts))
-      if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
-      elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
-      elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
-      else gemini_age_str="$((gemini_age_sec / 86400))d ago"
-      fi
-      gemini_age_color="${DIM}"; [ "$gemini_age_sec" -lt 600 ] && gemini_age_color="${CYAN}"
-      gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ran${RESET}"
-    elif [ -f "$gemini_last_json" ]; then
-      gemini_ts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
-      gemini_chars=$(jq -r '.chars_out // 0' "$gemini_last_json" 2>/dev/null)
-      gemini_elapsed=$(jq -r '.elapsed_s // 0' "$gemini_last_json" 2>/dev/null)
-      gemini_status=$(jq -r '.status // "unknown"' "$gemini_last_json" 2>/dev/null)
-      gemini_task=$(jq -r '.task_name // empty' "$gemini_last_json" 2>/dev/null)
-
-      if [ -n "$gemini_ts" ]; then
-        gemini_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gemini_ts" +%s 2>/dev/null)
-        if [ -n "$gemini_ts_sec" ]; then
-          gemini_now_sec=$(date -u +%s)
-          gemini_age_sec=$((gemini_now_sec - gemini_ts_sec))
-          if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
-          elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
-          elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
-          else gemini_age_str="$((gemini_age_sec / 86400))d ago"
-          fi
-
-          if [ "$gemini_age_sec" -lt 600 ]; then gemini_age_color="${CYAN}"
-          else gemini_age_color="${DIM}"
-          fi
-
-          if [ "$gemini_chars" -ge 1000 ]; then
-            gemini_char_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars/1000}")
-          else
-            gemini_char_disp="$gemini_chars"
-          fi
-
-          gemini_char_color="${WHITE}"
-          [ "$gemini_status" = "failed" ] && gemini_char_color="${RED}"
-
-          gemini_task_str=""
-          [ -n "$gemini_task" ] && gemini_task_str="${WHITE}${gemini_task}${RESET}${DIM} · ${RESET}"
-
-          gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_task_str}${gemini_char_color}${gemini_char_disp}${RESET} ${DIM}chars · ${RESET}${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ${gemini_elapsed}s${RESET}"
-        fi
-      fi
-    else
-      gemini_part="${gemini_part}${SEP}${DIM}no dispatches yet${RESET}"
-    fi
-
-    gemini_line="$gemini_part"
+    codex_age_color="${DIM}"; [ "$codex_age_sec" -lt 600 ] && codex_age_color="${CYAN}"
+    if [ "$codex_tokens" -ge 1000 ]; then codex_tok_disp=$(awk "BEGIN{printf \"%.1fk\", $codex_tokens/1000}"); else codex_tok_disp="$codex_tokens"; fi
+    codex_tok_color="${WHITE}"; [ "$codex_status" = "failed" ] && codex_tok_color="${RED}"
+    codex_task_str=""; [ -n "$codex_task" ] && codex_task_str="${WHITE}${codex_task}${RESET}${DIM} · ${RESET}"
+    codex_part="${codex_part}${SEP}${DIM}last:${RESET} ${codex_task_str}${codex_tok_color}${codex_tok_disp}${RESET} ${DIM}toks · ${RESET}${codex_age_color}${codex_age_str}${RESET}${DIM} · ${codex_elapsed}s${RESET}"
+  else
+    codex_part="${codex_part}${SEP}${DIM}no dispatches yet${RESET}"
   fi
 
-  [ -n "$gemini_line" ] && out="${out}\n${gemini_line}"
+  codex_line="$codex_part"
+fi
 
-fi  # end registry/fallback branch
+[ -n "$codex_line" ] && out="${out}\n${codex_line}"
+
+# ── agy (Antigravity) dispatch line (third row) ──────────────────────────────
+# Antigravity CLI replaced Gemini CLI (cutover 2026-05-29). The dispatch wrapper
+# still writes ~/.claude/gemini-last.json + logs/gemini-*.log (filenames kept),
+# now with an `executor` field. Uses chars_out (agy print mode doesn't reliably
+# emit token counts). Cap default 100 per 5h — override via GEMINI_DISPATCH_CAP_5H.
+gemini_line=""
+gemini_last_json="$HOME/.claude/gemini-last.json"
+agy_bin="$(command -v agy 2>/dev/null || true)"
+[ -z "$agy_bin" ] && [ -x "$HOME/.local/bin/agy" ] && agy_bin="$HOME/.local/bin/agy"
+
+if [ -n "$agy_bin" ]; then
+  # Label: "Antigravity" in bold Antigravity-purple (mirrors "codex" styling).
+  gemini_part="${GEMINI_PURPLE}${BOLD}Antigravity${RESET}"
+
+  # Append the active model agy is using, read from its settings — this is the pinned
+  # DEFAULT (set via the interactive /model command and persisted here), so it stays
+  # accurate as the pin changes. NOTE (2026-08-18): agy 1.1.13 DOES have `--model` and
+  # `--effort` flags, so an individual dispatch can override this pin (AGY_MODEL /
+  # AGY_EFFORT on gemini-dispatch.sh) and the row will still show the default. Earlier
+  # comments here claiming "agy has no CLI model flag" were stale.
+  # Cyan when a dispatch ran in the last 10 min, dim otherwise.
+  agy_settings="$HOME/.gemini/antigravity-cli/settings.json"
+  agy_model=""
+  [ -f "$agy_settings" ] && agy_model=$(jq -r '.model // empty' "$agy_settings" 2>/dev/null)
+  if [ -n "$agy_model" ]; then
+    gemini_model_color="${DIM}"
+    gt=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
+    if [ -n "$gt" ]; then
+      gts=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gt" +%s 2>/dev/null)
+      if [ -n "$gts" ] && [ "$(( $(date -u +%s) - gts ))" -lt 600 ]; then
+        gemini_model_color="${CYAN}"
+      fi
+    fi
+    gemini_part="${gemini_part} ${DIM}·${RESET} ${gemini_model_color}${agy_model}${RESET}"
+  fi
+
+  # Dispatches per rolling 5h window.
+  # agy's REAL quota lives only in its in-memory quota_manager (investigated
+  # 2026-07-22 — nothing numeric on disk; TUI /usage is the only view), so the
+  # old `:-100` default was a fiction (rendered "470/~100" 2026-08-03). A cap
+  # bar + denominator now renders ONLY when GEMINI_DISPATCH_CAP_5H pins a real
+  # number; otherwise show the plain count and invent nothing.
+  gemini_cap_5h="${GEMINI_DISPATCH_CAP_5H:-}"
+  [[ "$gemini_cap_5h" =~ ^[0-9]+$ ]] && [ "$gemini_cap_5h" -ge 1 ] || gemini_cap_5h=""
+  gemini_dispatches_5h=0
+  gemini_chars_5h=0
+  if [ -d "$HOME/.claude/logs" ]; then
+    gemini_cutoff_5h=$(date -u -v-5H +%s 2>/dev/null)
+    if [ -n "$gemini_cutoff_5h" ]; then
+      for f in "$HOME"/.claude/logs/gemini-*.log; do
+        [ -f "$f" ] || continue
+        m=$(stat -f "%m" "$f" 2>/dev/null)
+        if [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -ge "$gemini_cutoff_5h" ]; then
+          gemini_dispatches_5h=$((gemini_dispatches_5h+1))
+          c=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+          [ -n "$c" ] && gemini_chars_5h=$((gemini_chars_5h + c))
+        fi
+      done
+    fi
+  fi
+  gemini_dispatches_5h=$((gemini_dispatches_5h + led_agy_n))   # + direct `agy -p` via shim
+  if [ "$gemini_chars_5h" -ge 1000 ]; then
+    gemini_chars_5h_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars_5h/1000}")
+  else
+    gemini_chars_5h_disp="$gemini_chars_5h"
+  fi
+  # ── Real quota bars (agy's own language-server RPC) ────────────────────────
+  # ~/.claude/agy-quota.json holds the REAL 5h + weekly buckets (percent used),
+  # refreshed by scripts/agy-quota-refresh.sh. agy quota is token-COST based,
+  # not call-count, so these bars are the only honest capacity signal — the old
+  # `N/~100` denominator was invented. Falls back to the plain call count when
+  # the file is missing or stale.
+  agy_quota_cache="$HOME/.claude/agy-quota.json"
+  agy_quota_refresh="$HOME/.claude/scripts/agy-quota-refresh.sh"
+  agy_quota_fresh=0
+  if [ -f "$agy_quota_cache" ]; then
+    agy_q_ts=$(jq -r '.fetched_at // empty' "$agy_quota_cache" 2>/dev/null)
+    if [[ "$agy_q_ts" =~ ^[0-9]+$ ]] && [ "$((now_epoch - agy_q_ts))" -lt 900 ]; then
+      agy_quota_fresh=1
+    fi
+  fi
+  # Stale → kick a detached refresh (boots the LS for ~2s, spends no quota).
+  if [ "$agy_quota_fresh" -eq 0 ] && [ -x "$agy_quota_refresh" ]; then
+    nohup "$agy_quota_refresh" </dev/null >/dev/null 2>&1 &
+  fi
+
+  agy_quota_part=""
+  if [ "$agy_quota_fresh" -eq 1 ]; then
+    while IFS=$'\t' read -r q_label q_pct q_reset q_window; do
+      [ -n "$q_pct" ] || continue
+      q_int=$(printf '%.0f' "$q_pct" 2>/dev/null); [[ "$q_int" =~ ^[0-9]+$ ]] || continue
+      [ "$q_int" -gt 100 ] && q_int=100
+      q_remaining=$(time_until "$q_reset" "$q_window")
+      q_clock=$(reset_clock "$q_reset" "$q_window")
+      q_text="${DIM}${q_label}:${RESET}$(pct_color "$q_int")${q_int}%${RESET}"
+      if [ -n "$q_remaining" ] && [ -n "$q_clock" ]; then
+        q_text="${q_text} ${DIM}(${q_remaining} - ${q_clock})${RESET}"
+      fi
+      [ -n "$agy_quota_part" ] && agy_quota_part="${agy_quota_part}${SEP}"
+      agy_quota_part="${agy_quota_part}$(make_bar "$q_int" 10) ${q_text}"
+    done < <(jq -r '.groups.gemini | ["5h", (.five_hour.used_percent // empty), (.five_hour.resets_at // 0), 18000], ["7d", (.weekly.used_percent // empty), (.weekly.resets_at // 0), 604800] | @tsv' "$agy_quota_cache" 2>/dev/null)
+  fi
+
+  if [ -n "$agy_quota_part" ]; then
+    gemini_part="${gemini_part}${SEP}${agy_quota_part}${SEP}${WHITE}${gemini_dispatches_5h}${RESET}${DIM} calls (5h)${RESET}"
+  elif [ -n "$gemini_cap_5h" ]; then
+    gemini_dispatch_pct=$(awk "BEGIN{printf \"%d\", ($gemini_dispatches_5h/$gemini_cap_5h)*100 + 0.5}")
+    [ "$gemini_dispatch_pct" -gt 100 ] && gemini_dispatch_pct=100
+    gemini_dispatch_bar=$(make_bar "$gemini_dispatch_pct" 10)
+    gemini_dispatch_color=$(pct_color "$gemini_dispatch_pct")
+    gemini_part="${gemini_part}${SEP}${gemini_dispatch_bar} ${gemini_dispatch_color}${gemini_dispatches_5h}${RESET}${DIM}/~${gemini_cap_5h} · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+  else
+    gemini_part="${gemini_part}${SEP}${WHITE}${gemini_dispatches_5h}${RESET}${DIM} calls · ${RESET}${WHITE}${gemini_chars_5h_disp}${RESET}${DIM} chars (5h)${RESET}"
+  fi
+
+  # `last:` reflects the freshest signal: rich wrapper json (gemini-last.json —
+  # task/chars) OR a bare `agy` call caught by the shim (ledger — no metadata).
+  gemini_json_ts_sec=0
+  if [ -f "$gemini_last_json" ]; then
+    gjts=$(jq -r '.timestamp // empty' "$gemini_last_json" 2>/dev/null)
+    [ -n "$gjts" ] && gemini_json_ts_sec=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$gjts" +%s 2>/dev/null)
+    [[ "$gemini_json_ts_sec" =~ ^[0-9]+$ ]] || gemini_json_ts_sec=0
+  fi
+  gemini_now_sec=$(date -u +%s)
+  if [ "${agy_live:-0}" -gt 0 ]; then
+    # an agy job is running RIGHT NOW — show it's alive (its stdout/last.json may
+    # not land until it finishes, and headless agy can spin silently)
+    gemini_part="${gemini_part}${SEP}${GREEN}${BOLD}running now${RESET}"
+  elif [ "$led_agy_last_ts" -gt "$gemini_json_ts_sec" ]; then
+    gemini_age_sec=$((gemini_now_sec - led_agy_last_ts))
+    if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
+    elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
+    elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
+    else gemini_age_str="$((gemini_age_sec / 86400))d ago"
+    fi
+    gemini_age_color="${DIM}"; [ "$gemini_age_sec" -lt 600 ] && gemini_age_color="${CYAN}"
+    gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_age_color}${gemini_age_str}${RESET}${DIM} · direct call${RESET}"
+  elif [ "$gemini_json_ts_sec" -gt 0 ]; then
+    gemini_chars=$(jq -r '.chars_out // 0' "$gemini_last_json" 2>/dev/null)
+    gemini_elapsed=$(jq -r '.elapsed_s // 0' "$gemini_last_json" 2>/dev/null)
+    gemini_status=$(jq -r '.status // "unknown"' "$gemini_last_json" 2>/dev/null)
+    gemini_task=$(jq -r '.task_name // empty' "$gemini_last_json" 2>/dev/null)
+    gemini_age_sec=$((gemini_now_sec - gemini_json_ts_sec))
+    if   [ "$gemini_age_sec" -lt 60 ];    then gemini_age_str="${gemini_age_sec}s ago"
+    elif [ "$gemini_age_sec" -lt 3600 ];  then gemini_age_str="$((gemini_age_sec / 60))m ago"
+    elif [ "$gemini_age_sec" -lt 86400 ]; then gemini_age_str="$((gemini_age_sec / 3600))h ago"
+    else gemini_age_str="$((gemini_age_sec / 86400))d ago"
+    fi
+    gemini_age_color="${DIM}"; [ "$gemini_age_sec" -lt 600 ] && gemini_age_color="${CYAN}"
+    if [ "$gemini_chars" -ge 1000 ]; then gemini_char_disp=$(awk "BEGIN{printf \"%.1fk\", $gemini_chars/1000}"); else gemini_char_disp="$gemini_chars"; fi
+    gemini_char_color="${WHITE}"; [ "$gemini_status" = "failed" ] && gemini_char_color="${RED}"
+    gemini_task_str=""; [ -n "$gemini_task" ] && gemini_task_str="${WHITE}${gemini_task}${RESET}${DIM} · ${RESET}"
+    gemini_part="${gemini_part}${SEP}${DIM}last:${RESET} ${gemini_task_str}${gemini_char_color}${gemini_char_disp}${RESET} ${DIM}chars · ${RESET}${gemini_age_color}${gemini_age_str}${RESET}${DIM} · ${gemini_elapsed}s${RESET}"
+  else
+    gemini_part="${gemini_part}${SEP}${DIM}no dispatches yet${RESET}"
+  fi
+
+  gemini_line="$gemini_part"
+fi
+
+[ -n "$gemini_line" ] && out="${out}\n${gemini_line}"
+
+# ── claude -p headless line (fourth row) ─────────────────────────────────────
+# High-volume `claude -p` calls (e.g. Haiku extraction in scrapers) are the real
+# Claude burn but otherwise never surface here. Logged via llm-tick; shown only
+# when >0 in the rolling 5h window. Cost is summed from ledger cost_usd.
+if [ "$led_cp_n" -gt 0 ]; then
+  cp_cost_disp=$(awk "BEGIN{printf \"%.2f\", $led_cp_cost}")
+  cp_part="${YELLOW}${BOLD}claude -p${RESET}${SEP}${WHITE}${led_cp_n}${RESET}${DIM} calls (5h)${RESET}${SEP}${WHITE}\$${cp_cost_disp}${RESET}${DIM} est${RESET}"
+  out="${out}\n${cp_part}"
+fi
 
 printf "%b" "$out"
