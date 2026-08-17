@@ -91,7 +91,12 @@ COMP_NAME_7="burn_rate"
 COMP_LABEL_7="Burn-rate advisor (/burn + a hook that widens fan-out when 5h budget would otherwise expire unused)"
 COMP_FILES_7="hooks/burn-rate-advisor.js:hooks/burn-rate-advisor.js commands/burn.md:commands/burn.md"
 
-COMP_COUNT=8
+# Index 8: Cross-provider balancing
+COMP_NAME_8="balance"
+COMP_LABEL_8="Cross-provider balancing (/balance + agy-router hook: route work to the provider you are NOT exhausting)"
+COMP_FILES_8="scripts/quota-balance.mjs:scripts/quota-balance.mjs commands/balance.md:commands/balance.md hooks/agy-router.js:hooks/agy-router.js agents/agy-worker.md:agents/agy-worker.md"
+
+COMP_COUNT=9
 
 # Statusline files — always installed (no prompt).
 STATUSLINE_FILES="statusline.sh:statusline.sh"
@@ -189,7 +194,9 @@ check_deps() {
 install_files() {
   echo "-> Installing to $CLAUDE_DIR (mode: $MODE)"
 
-  mkdir -p "$CLAUDE_DIR/scripts" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/hooks"
+  # agents/ holds subagent definitions (e.g. agy-worker) — added with cross-provider
+  # balancing; without it those files have nowhere to land.
+  mkdir -p "$CLAUDE_DIR/scripts" "$CLAUDE_DIR/commands" "$CLAUDE_DIR/hooks" "$CLAUDE_DIR/agents"
 
   local backed_up=0
   for entry in $ACTIVE_FILES; do
@@ -454,6 +461,17 @@ HEADER
   fi
   if [ "${INSTALL_4:-0}" -eq 1 ]; then
     pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/ruflo-model-enforcer.js" }'
+  fi
+  # agy-router is INDEPENDENT of RuFlo — one picks the Claude tier, the other picks the
+  # provider. Either can be installed without the other, so this appends rather than
+  # nesting inside the RuFlo block.
+  if [ "${INSTALL_8:-0}" -eq 1 ]; then
+    if [ -n "$pre_tool_hooks" ]; then
+      pre_tool_hooks="${pre_tool_hooks},
+          { \"type\": \"command\", \"command\": \"node ~/.claude/hooks/agy-router.js\" }"
+    else
+      pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/agy-router.js" }'
+    fi
   fi
   # The burn advisor also fires at the fan-out decision point. It needs a WIDER
   # matcher than RuFlo (Workflow calls too), so it gets its own PreToolUse entry.
