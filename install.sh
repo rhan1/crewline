@@ -96,7 +96,12 @@ COMP_NAME_8="balance"
 COMP_LABEL_8="Cross-provider balancing (/balance + agy-router hook: route work to the provider you are NOT exhausting)"
 COMP_FILES_8="scripts/quota-balance.mjs:scripts/quota-balance.mjs commands/balance.md:commands/balance.md hooks/agy-router.js:hooks/agy-router.js agents/agy-worker.md:agents/agy-worker.md"
 
-COMP_COUNT=9
+# Index 9: Executor tabs (manager -> executor lane)
+COMP_NAME_9="executor_tabs"
+COMP_LABEL_9="Executor tabs (/handoff + spawn-executor.sh: hand a spec to a dedicated Warp-tab session)"
+COMP_FILES_9="scripts/spawn-executor.sh:scripts/spawn-executor.sh commands/handoff.md:commands/handoff.md"
+
+COMP_COUNT=10
 
 # Statusline files — always installed (no prompt).
 STATUSLINE_FILES="statusline.sh:statusline.sh"
@@ -119,7 +124,7 @@ prompt_yes() {
 
 # ---------------------------------------------------------------------------
 # Decide which components to install based on preset / interactive prompts.
-# Sets INSTALL_0 .. INSTALL_5 to 1 (yes) or 0 (no).
+# Sets INSTALL_0 .. INSTALL_<COMP_COUNT-1> to 1 (yes) or 0 (no).
 # ---------------------------------------------------------------------------
 decide_components() {
   local i=0
@@ -235,7 +240,17 @@ install_files() {
 # Uninstall: walk the full set of all known files.
 # ---------------------------------------------------------------------------
 uninstall_files() {
-  local all_files="$STATUSLINE_FILES $COMP_FILES_0 $COMP_FILES_1 $COMP_FILES_2 $COMP_FILES_3 $COMP_FILES_4 $COMP_FILES_5 $COMP_FILES_6 $DISPATCH_GENERIC_FILES"
+  # Built by LOOPING over COMP_COUNT, never by hand-listing COMP_FILES_N.
+  # The hand-written list drifted before: components 6, 7 and 8 shipped while the
+  # uninstall walk still stopped at 5, so `--uninstall` silently left their
+  # symlinks behind. Adding a component must not require editing this function.
+  local all_files="$STATUSLINE_FILES $DISPATCH_GENERIC_FILES"
+  local i=0
+  while [ "$i" -lt "$COMP_COUNT" ]; do
+    eval "local cfiles=\"\$COMP_FILES_${i}\""
+    all_files="$all_files $cfiles"
+    i=$(( i + 1 ))
+  done
   echo "-> Uninstalling from $CLAUDE_DIR"
   for entry in $all_files; do
     local rel="${entry##*:}"
