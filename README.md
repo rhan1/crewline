@@ -3,7 +3,7 @@
 A drop-in Claude Code setup that gives you:
 
 1. **A multi-row statusline** showing Claude context, rate-limits (5h + 7d with absolute reset clocks), cache savings, cost, plus dedicated rows for Codex and Gemini dispatch activity. Rate limits use **cross-session reconciliation** (every open session converges on one shared number instead of each showing its own stale snapshot); the Codex row shows **real Codex rate-limit windows** (fetched in the background from `codex app-server`, falling back to a dispatch-count estimate when unavailable); executor rows show a live **`running now`** badge while a dispatch or interactive TUI session is in flight; and a **`bg-claude`** indicator surfaces background `claude -p` jobs that are otherwise invisible to the 5h bar.
-2. **Slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, schedule plans for the next rate-limit window, and show a live view of native subagents (`/agents`). Dispatch wrappers snapshot the working tree around every call and report exactly which files the executor wrote (`[Mutation]` in the log, `mutated`/`mutation_action` in the JSON) — set `CODEX_EXPECT_READONLY=1` to have a nominally read-only run undo its own writes, which is refused if the tree was already dirty. They also carry a built-in **watchdog** (background 60s poll — kills and notifies on stalled or overtime runs, no GNU `timeout` needed) and record honest statuses (`timeout` / `stalled` / `empty` / `suspect`) with a `status_detail` field instead of trusting exit-code success.
+2. **Slash commands** that force-dispatch work to Codex or Gemini, budget-check a plan before committing to execution, schedule plans for the next rate-limit window, show a live view of native subagents (`/agents`), and hand a whole build off to a dedicated executor session in its own named terminal tab (`/handoff`). Dispatch wrappers snapshot the working tree around every call and report exactly which files the executor wrote (`[Mutation]` in the log, `mutated`/`mutation_action` in the JSON) — set `CODEX_EXPECT_READONLY=1` to have a nominally read-only run undo its own writes, which is refused if the tree was already dirty. They also carry a built-in **watchdog** (background 60s poll — kills and notifies on stalled or overtime runs, no GNU `timeout` needed) and record honest statuses (`timeout` / `stalled` / `empty` / `suspect`) with a `status_detail` field instead of trusting exit-code success.
 3. **Hooks** that warn you before a heavy turn blows the 5h window, tell you when to *spend* surplus budget that would otherwise expire (and when to pull back), rotate dispatch logs weekly, and (optionally) log native-subagent lifecycle for the `/agents` monitor.
 
 The core idea: keep Claude (Opus / Sonnet) on judgment, debugging, smoke-testing, and architecture. Delegate mechanical code generation and long-context / multi-modal work to Codex and Gemini — they're cheaper, sometimes faster, and each has a capability profile the other can't match.
@@ -28,6 +28,7 @@ Rows 2 and 3 only render when Codex / Gemini are installed. First row always ren
 **Optional but recommended:**
 - **[Codex CLI](https://github.com/openai/codex)** — `brew install codex` — enables Codex dispatches and the Codex statusline row. Requires a ChatGPT Plus/Pro/Enterprise subscription.
 - **[Gemini CLI](https://github.com/google-gemini/gemini-cli)** — `npm install -g @google/gemini-cli` then `gemini` to OAuth — enables Gemini dispatches and the Gemini statusline row. Free tier works; Pro recommended for larger contexts.
+- **[Warp](https://warp.dev)** — only needed for `/handoff` / **Executor tabs**, which drive named Warp tabs via `~/.warp/tab_configs`. Nothing else in the repo touches it.
 
 The statusline degrades gracefully — if `codex` or `gemini` isn't installed, those rows simply don't render.
 
@@ -76,6 +77,7 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `/burn` | Burn-rate posture: is there surplus 5h budget that will expire unused, or should you conserve? Reports SPRINT / SPEND / NORMAL / CONSERVE / CRITICAL |
 | `/agents` | Live view of native Claude subagents (Agent/Task tool) — running vs done, each one's task, duration, and a completion count. Reads the subagent transcripts Claude Code maintains, so it works across sessions and even when rate-limited |
 | `/balance` | Cross-provider budget health: scores Claude / Codex / Gemini together and says who should take the next job. See **Cross-provider balancing** below |
+| `/handoff <slug> <task>` | Hand a task to a dedicated executor session in its own named Warp tab, keeping the current session free to plan and review. See **Executor tabs** below |
 
 ## Hooks
 
@@ -152,6 +154,54 @@ And a third, about the instrument itself: measure quality separately from correc
 **Tuning:** the keyword lists are at the top of `hooks/ruflo-model-enforcer.js` in a `KEYWORDS` object. Add or remove terms to match your own usage patterns. The length thresholds (200 / 400 chars) are also in the same block.
 
 The installer prompts before installing this hook. To add it later, copy or symlink `hooks/ruflo-model-enforcer.js` to `~/.claude/hooks/` and add the `PreToolUse` block from `examples/settings.json`.
+
+## Executor tabs (manager→executor lane)
+
+Everything above routes *work*. This routes *sessions*.
+
+A session that is executing cannot also be thinking about what comes next, so
+past a certain size the session you're typing in is the wrong place to run the
+build. `/handoff` splits the two: the session you're in becomes the **manager**
+(planning, review, steering), and the build runs in a dedicated **executor**
+session in its own named Warp tab.
+
+```bash
+~/.claude/scripts/spawn-executor.sh <task-slug> [spec-file] [cwd] [model]
+```
+
+The script pre-seeds workspace trust for the cwd (so the executor never sits
+blocked on the "Do you trust this folder?" dialog), writes a Warp tab config,
+and opens a tab named after the slug. Claude engines boot with `/color purple`
+so a purple prompt bar plus a purple tab reads at a glance as "agent session,
+not a human typing." Model is a positional argument, not a constant —
+`opus`, `opus[1m]`, `sonnet`, `haiku`, or `codex` / `agy` to run those CLIs
+instead of Claude (optional; they must be on `$PATH`, and their tabs stay open
+after exit so you can read the output). Defaults come from `EXECUTOR_MODEL` and
+`EXECUTOR_EFFORT`.
+
+Two details are what make the lane actually usable rather than a way to lose
+track of work:
+
+- **The spec is the whole game.** The executor starts with zero conversation
+  context, so `~/.claude/handoffs/<slug>.md` has to carry the goal, the file
+  paths, the constraints, and the verification steps. A vague spec buys you a
+  confident wrong answer in a tab you weren't watching.
+- **A report-back contract, every time.** The executor's final step is writing
+  `~/.claude/handoffs/<slug>.report.md` with DONE / NOT DONE / FILES CHANGED /
+  VERIFIED sections. Then the manager **spot-verifies the deliverable itself** —
+  "it finished" and "it worked" are different claims, and only one of them is
+  checkable. Claude tabs are kicked off and steered over `SendMessage` with
+  `notify_when_idle`; `codex` / `agy` tabs take the spec at boot and can't be
+  steered, so you watch their log and their report file instead.
+
+Note this lane is **not** covered by RuFlo, which only sees `Agent` tool calls —
+the model choice here is made explicitly at spawn time. And executor tabs are
+session-bound: closing the tab or rebooting kills the run. A tab is a window
+into a run, not a guarantee that it survives one.
+
+Use it at the plan→execute boundary, for anything running longer than ~15–20
+minutes, or for a second concurrent workstream. Don't use it for planning,
+review, or small delegations — a subagent already handles those more cheaply.
 
 ## Statusline
 
@@ -278,6 +328,7 @@ Routing heuristics the author has settled on after ~6 weeks of daily use:
 | 5+ similar mechanical sub-tasks in parallel | `/dispatch gemini` (Pro tier has more headroom than Codex Plus) |
 | Any other registered CLI model | `/dispatch <model_id>` |
 | Small edit (<30 lines) | **Claude direct** (dispatch overhead exceeds gain) |
+| Substantial build (>15–20 min), or a second parallel workstream | `/handoff` — executor tab, manager session stays free |
 
 Codex and Gemini have rough quality parity on code generation. The bottleneck is usually spec precision and your smoke-test discipline, not the model.
 
