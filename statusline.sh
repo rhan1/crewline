@@ -462,7 +462,7 @@ loc_part=""
 if [ -n "$cwd" ]; then
   branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null)
   if [ -n "$branch" ]; then
-    # Parse GitHub owner from origin remote (disambiguates rhan1 vs razakhanLL)
+    # Parse GitHub owner from origin remote (disambiguates personal vs work accounts)
     remote_url=$(git -C "$cwd" --no-optional-locks config --get remote.origin.url 2>/dev/null)
     owner=""
     if [ -n "$remote_url" ]; then
