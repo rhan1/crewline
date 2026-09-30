@@ -13,14 +13,26 @@ dc_timeout() {
 }
 
 # dc_codex_tier_targets TIER — echo "MODEL EFFORT SERVICE_TIER" for a tier name.
-# Single source of truth for the Codex tier table (validated live 2026-07-30:
-# `minimal` effort is rejected by the 5.6 family; supported = none|low|medium|
-# high|xhigh|max, plus `ultra` on sol).
+# Single source of truth for the Codex tier table (codex-cli 0.157.1, 2026-10-01).
+#
+# Ladder: Luna -> Terra -> Sol for executor work; Astra (max/algo) is reserved
+# for planning/review and is only used when forced with CODEX_TIER. GPT-6 Sol
+# and GPT-6 Luna shipped in late September 2026; there is no GPT-6 Terra, so
+# `std` stays on GPT-5.6 Terra.
+#
+# service_tier: OpenAI removed `flex` server-side on 2026-09-29 — every model
+# now returns 400 "Unsupported service_tier: flex" — so the ladder uses
+# `default`. `priority` costs extra and buys latency, not quota; never pay it.
+#
+# Effort: `minimal` is rejected by the 5.6/6 families; supported =
+# low|medium|high|xhigh|max, plus `ultra` on sol/astra (not luna).
 dc_codex_tier_targets() {
   case "${1:-}" in
-    lite) printf 'gpt-5.6-luna low flex\n' ;;
-    std)  printf 'gpt-5.6-terra high flex\n' ;;
-    max)  printf 'gpt-5.6-sol high priority\n' ;;   # ultra -> high (Raza, 2026-08-16): quota IS the binding constraint now
+    lite) printf 'gpt-6-luna low default\n' ;;
+    std)  printf 'gpt-5.6-terra high default\n' ;;
+    high) printf 'gpt-6-sol high default\n' ;;
+    max)  printf 'gpt-6-astra high default\n' ;;
+    algo) printf 'gpt-6-astra ultra default\n' ;;
     *)    return 1 ;;
   esac
 }

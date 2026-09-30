@@ -5,6 +5,18 @@ argument-hint: <task description with file paths and pattern references>
 
 Run the Codex dispatch workflow for the task below, even if the auto-dispatch heuristics wouldn't have fired. Do NOT shortcut the spec-writing or smoke-test steps.
 
+> **Executor:** Codex CLI, **tier-routed**. `codex-dispatch.sh` picks a tier per task (auto-routing tops out at `high`; `max`/`algo` only when forced):
+>
+> | Tier | Model | Effort | service_tier | Typical work |
+> |---|---|---|---|---|
+> | `lite` | gpt-6-luna | low | default | renames, typos, reformatting, boilerplate |
+> | `std` | gpt-5.6-terra | high | default | most mechanical code / API / data-transform specs (there is no GPT-6 Terra) |
+> | `high` | gpt-6-sol | high | default | executor top tier: hard mechanical builds, multi-file parsers |
+> | `max` | gpt-6-astra | high | default | forced only: audits, planning review, hard debugging |
+> | `algo` | gpt-6-astra | ultra | default | forced only: genuinely algorithmic specs |
+>
+> `flex` was removed server-side on 2026-09-29 (every model returns `Unsupported service_tier: flex`) — never set `CODEX_SERVICE_TIER=flex`. Overrides: `CODEX_TIER=lite|std|high|max|algo` forces a tier; `CODEX_ROUTER=off` reverts to whatever `~/.codex/config.toml` says; `CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_SERVICE_TIER` override individual knobs. Anything unexpected (classifier missing, bad tier name) falls back to `std`, never `max`.
+
 ## Task
 $ARGUMENTS
 

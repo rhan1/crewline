@@ -9,7 +9,8 @@
 #   ~/.claude/codex-last.json            — { timestamp, task_name, tokens,
 #                                            elapsed_s, status, status_detail,
 #                                            exit_code, spec_path, log_path,
-#                                            model, reasoning_effort }
+#                                            model, reasoning_effort, tier,
+#                                            route_source, service_tier }
 #   ~/.claude/codex-auth-cache.txt       — refreshed for statusline
 #
 # Exit code passes through from `codex exec` so callers can branch on failure.
@@ -32,6 +33,97 @@ CLAUDE_DIR="$HOME/.claude"
 LOG_DIR="$CLAUDE_DIR/logs"
 mkdir -p "$LOG_DIR"
 
+# ── Tier routing ──────────────────────────────────────────────────────────────
+# Codex quota is a binding constraint, so a dispatch no longer inherits the
+# global ~/.codex/config.toml model. A tier is chosen per task; the table lives
+# in dispatch-common.sh (dc_codex_tier_targets).
+#
+# Env controls:
+#   CODEX_TIER=lite|std|high|max|algo
+#                             force a tier, skip classification. `max`/`algo`
+#                             (GPT-6 Astra) are never chosen automatically.
+#   CODEX_ROUTER=off          disable routing entirely (naked invocation =
+#                             whatever ~/.codex/config.toml says)
+#   CODEX_MODEL / CODEX_EFFORT / CODEX_SERVICE_TIER
+#                             override individual knobs after tier selection
+#   CODEX_CX_LITE_MAX / CODEX_CX_MAX_MIN
+#                             complexity thresholds (percent) for recalibration
+#
+# Auto-classification uses the `ruflo` CLI's complexity score when it is on
+# PATH (`ruflo hooks model-route`); complexity separates cleanly (renames
+# ~10%, mechanical loaders ~30%, architecture/debug ~50%). Any failure —
+# ruflo absent, hang, unparseable JSON — falls back to `std`: the safe
+# middle, never `max`, so a broken classifier cannot silently restore
+# full-price dispatching.
+ROUTER_MODE="${CODEX_ROUTER:-on}"
+TIER=""
+ROUTE_SOURCE="none"
+ROUTE_CX=0
+export CX_LITE_MAX="${CODEX_CX_LITE_MAX:-20}"   # below this -> lite
+export CX_MAX_MIN="${CODEX_CX_MAX_MIN:-42}"     # at/above this -> high
+codex_tier_from_ruflo() {
+  local text raw parsed
+  command -v ruflo >/dev/null 2>&1 || return 1
+  text="$(printf '%s %s' "$TASK_NAME" "$(head -c 2000 "$SPEC_FILE" 2>/dev/null)" \
+          | tr '\n\r\t' '   ' \
+          | tr -cd '[:alnum:][:space:]._/-' \
+          | cut -c1-400)"
+  [ -n "$text" ] || return 1
+  raw="$(dc_timeout 20 ruflo hooks model-route -t "$text" --format json 2>/dev/null)" || return 1
+  parsed="$(printf '%s\n' "$raw" | sed -n '/^[[:space:]]*{/,$p' | python3 -c '
+import json, os, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+raw_cx = d.get("complexity")
+if raw_cx is None:
+    sys.exit(1)
+cx = float(raw_cx) * 100
+lite_max = float(os.environ["CX_LITE_MAX"])
+max_min = float(os.environ["CX_MAX_MIN"])
+tier = "lite" if cx < lite_max else ("std" if cx < max_min else "high")
+print("%s %d" % (tier, round(cx)))
+' 2>/dev/null)" || return 1
+  [ -n "$parsed" ] || return 1
+  printf '%s\n' "$parsed"
+}
+
+if [ "$ROUTER_MODE" = "off" ]; then
+  ROUTE_SOURCE="disabled"
+else
+  case "${CODEX_TIER:-}" in
+    lite|std|high|max|algo)
+      TIER="$CODEX_TIER"; ROUTE_SOURCE="forced" ;;
+    "")
+      if ROUTE_RESULT="$(codex_tier_from_ruflo)"; then
+        TIER="${ROUTE_RESULT%% *}"; ROUTE_CX="${ROUTE_RESULT##* }"; ROUTE_SOURCE="ruflo"
+      else
+        TIER="std"; ROUTE_SOURCE="fallback"
+      fi ;;
+    *)
+      echo "warning: ignoring invalid CODEX_TIER='$CODEX_TIER' (want lite|std|high|max|algo); using std" >&2
+      TIER="std"; ROUTE_SOURCE="fallback" ;;
+  esac
+fi
+
+CODEX_ARGS=()
+TIER_MODEL=""
+TIER_EFFORT=""
+SERVICE_TIER=""
+if [ -n "$TIER" ]; then
+  TIER_TARGETS="$(dc_codex_tier_targets "$TIER")"
+  TIER_MODEL="$(printf '%s' "$TIER_TARGETS" | awk '{print $1}')"
+  TIER_EFFORT="$(printf '%s' "$TIER_TARGETS" | awk '{print $2}')"
+  SERVICE_TIER="$(printf '%s' "$TIER_TARGETS" | awk '{print $3}')"
+  TIER_MODEL="${CODEX_MODEL:-$TIER_MODEL}"
+  TIER_EFFORT="${CODEX_EFFORT:-$TIER_EFFORT}"
+  SERVICE_TIER="${CODEX_SERVICE_TIER:-$SERVICE_TIER}"
+  CODEX_ARGS=(-m "$TIER_MODEL"
+              -c "model_reasoning_effort=\"$TIER_EFFORT\""
+              -c "service_tier=\"$SERVICE_TIER\"")
+fi
+
 TS_FILE="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/codex-${TS_FILE}.log"
 LAST_JSON="$CLAUDE_DIR/codex-last.json"
@@ -42,6 +134,11 @@ LAST_JSON="$CLAUDE_DIR/codex-last.json"
 {
   echo "── codex-dispatch: $TASK_NAME @ $TS_FILE ──"
   echo "spec: $SPEC_FILE"
+  if [ -n "$TIER" ]; then
+    echo "[CodexRoute] tier=$TIER model=$TIER_MODEL effort=$TIER_EFFORT service_tier=$SERVICE_TIER source=$ROUTE_SOURCE complexity=${ROUTE_CX}%"
+  else
+    echo "[CodexRoute] routing $ROUTE_SOURCE — inheriting ~/.codex/config.toml"
+  fi
   echo ""
 } | tee -a "$LOG_FILE"
 
@@ -65,7 +162,7 @@ STATUS_FILE="$(mktemp "${TMPDIR:-/tmp}/codex-dispatch-status.XXXXXX")" || exit 1
 set -m
 (
   set +m
-  codex exec --dangerously-bypass-approvals-and-sandbox "$(cat "$SPEC_FILE")" </dev/null 2>&1 \
+  codex exec ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"} --dangerously-bypass-approvals-and-sandbox "$(cat "$SPEC_FILE")" </dev/null 2>&1 \
     | tee -a "$LOG_FILE"
   PIPE_EXIT="${PIPESTATUS[0]}"
   exit "$PIPE_EXIT"
@@ -159,6 +256,8 @@ TASK_NAME="$TASK_NAME" TOKENS="$TOKENS" ELAPSED="$ELAPSED" STATUS="$STATUS" \
 STATUS_DETAIL="$STATUS_DETAIL" EXIT_CODE="$EXIT_CODE" \
 SPEC_FILE="$SPEC_FILE" LOG_FILE="$LOG_FILE" \
 MODEL="$MODEL" REASONING="$REASONING" \
+TIER="$TIER" ROUTE_SOURCE="$ROUTE_SOURCE" ROUTE_CX="$ROUTE_CX" \
+SERVICE_TIER="$SERVICE_TIER" \
 dc_write_last_json "$LAST_JSON" codex
 
 {

@@ -122,6 +122,22 @@ Unconditional rules like "mechanical work goes to executor X" are what drain a s
 
 Disable either with `AGY_ROUTER_OFF=1`.
 
+### Codex tiers (`scripts/codex-dispatch.sh`)
+
+Every Codex dispatch is routed to a tier instead of inheriting the global `~/.codex/config.toml` model. The table is the single source of truth in `scripts/dispatch-common.sh` (`dc_codex_tier_targets`):
+
+| Tier | Model | Effort | Picked when |
+|---|---|---|---|
+| `lite` | `gpt-6-luna` | low | classifier complexity < 20% — renames, typos, boilerplate |
+| `std` | `gpt-5.6-terra` | high | 20–42% — most mechanical code (no GPT-6 Terra exists yet) |
+| `high` | `gpt-6-sol` | high | ≥ 42% — hard mechanical builds; the auto-route ceiling |
+| `max` | `gpt-6-astra` | high | `CODEX_TIER=max` only — audits, planning review |
+| `algo` | `gpt-6-astra` | ultra | `CODEX_TIER=algo` only — genuinely algorithmic specs |
+
+Auto-classification uses the `ruflo` CLI's complexity score when it is on PATH; without it every dispatch lands on `std` (never `max`, so a missing classifier cannot silently restore full-price dispatching). `CODEX_ROUTER=off` inherits `config.toml`; `CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_SERVICE_TIER` override single knobs. The tier, route source and service tier are written to `codex-last.json` and echoed as a `[CodexRoute]` line at the top of every dispatch log.
+
+Service tier is always `default`: OpenAI removed `flex` on 2026-09-29 (every model now returns `400 Unsupported service_tier: flex`), and `priority` buys latency, not quota.
+
 ### Model and effort selection
 
 `gemini-dispatch.sh` accepts `AGY_MODEL` and `AGY_EFFORT` (`low|medium|high`, default `high`). Run the strongest tier when the quota is idle — down-tiering a budget you never exhaust saves nothing and only costs quality.
