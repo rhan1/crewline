@@ -1,0 +1,22 @@
+{
+  "rows": [
+    {
+      "label": "Claude 7d",
+      "leftPct": 60,
+      "surplus": 45,
+      "state": "SPEND",
+      "floorBreach": false,
+      "secsLeft": 300000,
+      "resetsIn": "3d 11h"
+    },
+    {
+      "label": "agy weekly",
+      "leftPct": 90,
+      "surplus": 5,
+      "state": "ON PACE",
+      "floorBreach": false,
+      "secsLeft": 400000,
+      "resetsIn": "4d 15h"
+    }
+  ]
+}

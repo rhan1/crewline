@@ -84,6 +84,13 @@ function main() {
       resetsAt = state.rate_limits?.five_hour?.resets_at;
     } catch { return emit({}); }
 
+    // The cached window has already reset: its used% belongs to the old window — the
+    // new one is fresh, so there is nothing to warn about.
+    if (typeof resetsAt === 'number' && Math.floor(Date.now() / 1000) > resetsAt) {
+      log(`SKIP stale-window resets_at=${resetsAt} cached=${usedPct}`);
+      return emit({});
+    }
+
     if (typeof usedPct !== 'number' || usedPct < WARN_THRESHOLD) {
       log(`SKIP matched="${matchedPattern.source}" used=${usedPct}`);
       return emit({});
