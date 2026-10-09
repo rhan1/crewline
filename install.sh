@@ -11,6 +11,11 @@
 #   ./install.sh --copy       # copy files instead of symlinking (no auto-upgrade)
 #   ./install.sh --uninstall  # remove symlinks, restore backups if any
 #   ./install.sh -h|--help    # show this help
+#
+# Non-interactive component choice (CI, tests, scripted installs):
+#   CREWLINE_COMPONENTS="0,1,4,8" ./install.sh --copy
+#     installs exactly the listed component indexes (see the list printed by the
+#     interactive run) and skips every prompt, including the model wizard.
 
 set -euo pipefail
 
@@ -92,9 +97,12 @@ COMP_LABEL_7="Burn-rate advisor (/burn + a hook that widens fan-out when 5h budg
 COMP_FILES_7="hooks/burn-rate-advisor.js:hooks/burn-rate-advisor.js commands/burn.md:commands/burn.md"
 
 # Index 8: Cross-provider balancing
+# route-chain.js runs route-resolver.js (provider) then, if installed, ruflo-model-enforcer.js
+# (Claude tier) — so component 4 is optional alongside 8. agy-worker dispatches through
+# gemini-dispatch.sh, which ships with component 1.
 COMP_NAME_8="balance"
-COMP_LABEL_8="Cross-provider balancing (/balance + agy-router hook: route work to the provider you are NOT exhausting)"
-COMP_FILES_8="scripts/quota-balance.mjs:scripts/quota-balance.mjs commands/balance.md:commands/balance.md hooks/agy-router.js:hooks/agy-router.js agents/agy-worker.md:agents/agy-worker.md"
+COMP_LABEL_8="Cross-provider routing (ENFORCED): /balance, route-chain → route-resolver → RuFlo tier, agy-worker + audit"
+COMP_FILES_8="scripts/quota-balance.mjs:scripts/quota-balance.mjs scripts/agy-quota-refresh.sh:scripts/agy-quota-refresh.sh commands/balance.md:commands/balance.md hooks/route-resolver.js:hooks/route-resolver.js hooks/route-chain.js:hooks/route-chain.js hooks/agy-worker-audit.js:hooks/agy-worker-audit.js agents/agy-worker.md:agents/agy-worker.md"
 
 # Index 9: Executor tabs (manager -> executor lane)
 COMP_NAME_9="executor_tabs"
@@ -128,6 +136,17 @@ prompt_yes() {
 # ---------------------------------------------------------------------------
 decide_components() {
   local i=0
+  if [ -n "${CREWLINE_COMPONENTS:-}" ]; then
+    # Explicit list wins over --all/--minimal and never prompts.
+    while [ "$i" -lt "$COMP_COUNT" ]; do
+      case ",${CREWLINE_COMPONENTS// /}," in
+        *",${i},"*) eval "INSTALL_${i}=1" ;;
+        *)          eval "INSTALL_${i}=0" ;;
+      esac
+      i=$(( i + 1 ))
+    done
+    return
+  fi
   while [ "$i" -lt "$COMP_COUNT" ]; do
     eval "local label=\"\$COMP_LABEL_${i}\""
     case "$PRESET" in
@@ -331,6 +350,12 @@ run_model_wizard() {
   if [ "${INSTALL_0:-0}" -eq 0 ] && [ "${INSTALL_1:-0}" -eq 0 ]; then
     return
   fi
+  # Non-interactive runs (CREWLINE_COMPONENTS, or no terminal to prompt on) skip the
+  # wizard; the statusline falls back to its built-in Codex + Gemini rows.
+  if [ -n "${CREWLINE_COMPONENTS:-}" ] || ! { : </dev/tty; } 2>/dev/null; then
+    echo "info: non-interactive install — skipping the model registry wizard."
+    return
+  fi
 
   echo ""
   echo "─────────────────────────────────────────"
@@ -437,172 +462,86 @@ run_model_wizard() {
 }
 
 # ---------------------------------------------------------------------------
-# Settings hint — only print blocks for what was actually installed.
+# Settings hint — only include what was actually installed.
+#
+# The snippet is assembled as compact JSON fragments and pretty-printed through
+# `jq .`, so it is valid JSON for every component combination (a hand-written
+# trailing comma once made it invalid the moment a user pasted it). It is printed
+# between BEGIN/END marker lines so scripts can extract it.
 # ---------------------------------------------------------------------------
+_snip_add() { # _snip_add VARNAME json-fragment — comma-joins into VARNAME
+  eval "local _cur=\"\${$1}\""
+  if [ -n "$_cur" ]; then eval "$1=\"\${_cur},\$2\""; else eval "$1=\"\$2\""; fi
+}
+_snip_hook() { printf '{"type":"command","command":"node ~/.claude/hooks/%s"}' "$1"; }
+
+build_settings_snippet() {
+  local up="" pre_agent="" pre_burn="" ss="" sub_start="" sub_stop="" pre="" hooks="" top=""
+
+  [ "${INSTALL_2:-0}" -eq 1 ] && _snip_add up "$(_snip_hook auto-budget-check.js)"
+  [ "${INSTALL_7:-0}" -eq 1 ] && _snip_add up "$(_snip_hook burn-rate-advisor.js)"
+  [ "${INSTALL_5:-0}" -eq 1 ] && _snip_add ss "$(_snip_hook weekly-maintenance.js)"
+
+  # Claude Code runs PreToolUse hooks in parallel and keeps only one updatedInput, so the
+  # provider decision (route-resolver) and the Claude-tier decision (RuFlo) must not be two
+  # separate entries. With routing installed, route-chain.js is the ONE Agent hook and calls
+  # the RuFlo enforcer itself; without routing, the enforcer is wired directly as before.
+  if [ "${INSTALL_8:-0}" -eq 1 ]; then
+    _snip_add pre_agent "$(_snip_hook route-chain.js)"
+  elif [ "${INSTALL_4:-0}" -eq 1 ]; then
+    _snip_add pre_agent "$(_snip_hook ruflo-model-enforcer.js)"
+  fi
+  # The burn advisor also fires at the fan-out decision point. It needs a WIDER
+  # matcher (Workflow calls too), so it gets its own PreToolUse entry.
+  [ "${INSTALL_7:-0}" -eq 1 ] && _snip_add pre_burn "$(_snip_hook burn-rate-advisor.js)"
+
+  if [ "${INSTALL_6:-0}" -eq 1 ]; then
+    _snip_add sub_start "$(_snip_hook agent-activity-log.js)"
+    _snip_add sub_stop  "$(_snip_hook agent-activity-log.js)"
+  fi
+  [ "${INSTALL_8:-0}" -eq 1 ] && _snip_add sub_stop "$(_snip_hook agy-worker-audit.js)"
+
+  [ -n "$pre_agent" ] && _snip_add pre "{\"matcher\":\"Agent\",\"hooks\":[${pre_agent}]}"
+  [ -n "$pre_burn" ]  && _snip_add pre "{\"matcher\":\"Agent|Workflow\",\"hooks\":[${pre_burn}]}"
+
+  [ -n "$up" ]        && _snip_add hooks "\"UserPromptSubmit\":[{\"hooks\":[${up}]}]"
+  [ -n "$pre" ]       && _snip_add hooks "\"PreToolUse\":[${pre}]"
+  [ -n "$ss" ]        && _snip_add hooks "\"SessionStart\":[{\"hooks\":[${ss}]}]"
+  [ -n "$sub_start" ] && _snip_add hooks "\"SubagentStart\":[{\"hooks\":[${sub_start}]}]"
+  [ -n "$sub_stop" ]  && _snip_add hooks "\"SubagentStop\":[{\"hooks\":[${sub_stop}]}]"
+
+  _snip_add top '"statusLine":{"type":"command","command":"bash ~/.claude/statusline.sh","padding":2,"refreshInterval":10}'
+  # ROUTE_ENFORCE=1 lets route-resolver rewrite eligible Agent calls to agy-worker.
+  # Drop it to keep routing advisory (a one-line suggestion, no rewrite).
+  [ "${INSTALL_8:-0}" -eq 1 ] && _snip_add top '"env":{"ROUTE_ENFORCE":"1"}'
+  [ -n "$hooks" ]     && _snip_add top "\"hooks\":{${hooks}}"
+
+  printf '{%s}' "$top" | jq .
+}
+
 print_settings_hint() {
   cat <<'HEADER'
 
 ----------------------------------------------------------------
 Next step: merge this into ~/.claude/settings.json
+(merge into existing "env" / "hooks" sections if present — don't overwrite them)
 ----------------------------------------------------------------
-
-Statusline (always):
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/statusline.sh",
-    "padding": 2,
-    "refreshInterval": 10
-  }
 HEADER
+  echo "----- BEGIN crewline settings snippet -----"
+  build_settings_snippet
+  echo "----- END crewline settings snippet -----"
 
-  # Collect hook lines for components that were installed.
-  local user_prompt_hooks=""
-  local session_start_hooks=""
-  local pre_tool_hooks=""
-
-  if [ "${INSTALL_2:-0}" -eq 1 ]; then
-    user_prompt_hooks='          { "type": "command", "command": "node ~/.claude/hooks/auto-budget-check.js" }'
-  fi
-  if [ "${INSTALL_7:-0}" -eq 1 ]; then
-    if [ -n "$user_prompt_hooks" ]; then
-      user_prompt_hooks="${user_prompt_hooks},
-          { \"type\": \"command\", \"command\": \"node ~/.claude/hooks/burn-rate-advisor.js\" }"
-    else
-      user_prompt_hooks='          { "type": "command", "command": "node ~/.claude/hooks/burn-rate-advisor.js" }'
-    fi
-  fi
-  if [ "${INSTALL_5:-0}" -eq 1 ]; then
-    session_start_hooks='          { "type": "command", "command": "node ~/.claude/hooks/weekly-maintenance.js" }'
-  fi
-  if [ "${INSTALL_4:-0}" -eq 1 ]; then
-    pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/ruflo-model-enforcer.js" }'
-  fi
-  # agy-router is INDEPENDENT of RuFlo — one picks the Claude tier, the other picks the
-  # provider. Either can be installed without the other, so this appends rather than
-  # nesting inside the RuFlo block.
-  if [ "${INSTALL_8:-0}" -eq 1 ]; then
-    if [ -n "$pre_tool_hooks" ]; then
-      pre_tool_hooks="${pre_tool_hooks},
-          { \"type\": \"command\", \"command\": \"node ~/.claude/hooks/agy-router.js\" }"
-    else
-      pre_tool_hooks='          { "type": "command", "command": "node ~/.claude/hooks/agy-router.js" }'
-    fi
-  fi
-  # The burn advisor also fires at the fan-out decision point. It needs a WIDER
-  # matcher than RuFlo (Workflow calls too), so it gets its own PreToolUse entry.
-  local burn_pre_hooks=""
-  if [ "${INSTALL_7:-0}" -eq 1 ]; then
-    burn_pre_hooks='          { "type": "command", "command": "node ~/.claude/hooks/burn-rate-advisor.js" }'
-  fi
-  local subagent_hooks=""
-  if [ "${INSTALL_6:-0}" -eq 1 ]; then
-    subagent_hooks='          { "type": "command", "command": "node ~/.claude/hooks/agent-activity-log.js" }'
-  fi
-
-  # Only print the hooks block if at least one hook was installed.
-  local has_hooks=0
-  [ -n "$user_prompt_hooks" ]  && has_hooks=1
-  [ -n "$session_start_hooks" ] && has_hooks=1
-  [ -n "$pre_tool_hooks" ]     && has_hooks=1
-  [ -n "$burn_pre_hooks" ]     && has_hooks=1
-  [ -n "$subagent_hooks" ]     && has_hooks=1
-
-  if [ "$has_hooks" -eq 1 ]; then
+  if [ "${INSTALL_8:-0}" -eq 1 ] && [ "${INSTALL_1:-0}" -ne 1 ]; then
     echo ""
-    echo "Hooks (merge into existing \"hooks\" section if present):"
-    echo "  \"hooks\": {"
-
-    # Each event block is collected, then joined with commas at the end. Do NOT
-    # hardcode a trailing comma per block: whichever block happens to be last
-    # must not have one, or the emitted snippet is invalid JSON the moment a
-    # user pastes it into settings.json.
-    # Portable accumulator (no arrays — bash indexes from 0, zsh from 1, and
-    # this file gets sourced by both in testing).
-    local all_blocks=""
-    add_block() { [ -n "$all_blocks" ] && all_blocks="${all_blocks},
-"; all_blocks="${all_blocks}$1"; }
-
-    if [ -n "$user_prompt_hooks" ]; then
-      add_block "$(cat <<BLOCK
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-$user_prompt_hooks
-        ]
-      }
-    ]
-BLOCK
-)"
-    fi
-
-    if [ -n "$pre_tool_hooks" ] || [ -n "$burn_pre_hooks" ]; then
-      pre_entries=""
-      [ -n "$pre_tool_hooks" ] && pre_entries="$(cat <<BLOCK
-      {
-        "matcher": "Agent",
-        "hooks": [
-$pre_tool_hooks
-        ]
-      }
-BLOCK
-)"
-      if [ -n "$burn_pre_hooks" ]; then
-        [ -n "$pre_entries" ] && pre_entries="${pre_entries},"
-        pre_entries="${pre_entries}$(cat <<BLOCK
-      {
-        "matcher": "Agent|Workflow",
-        "hooks": [
-$burn_pre_hooks
-        ]
-      }
-BLOCK
-)"
-      fi
-      add_block "$(printf '    "PreToolUse": [\n%s\n    ]' "$pre_entries")"
-    fi
-
-    if [ -n "$session_start_hooks" ]; then
-      add_block "$(cat <<BLOCK
-    "SessionStart": [
-      {
-        "hooks": [
-$session_start_hooks
-        ]
-      }
-    ]
-BLOCK
-)"
-    fi
-
-    # SubagentStart/Stop both log lifecycle events for the /agents monitor.
-    if [ -n "$subagent_hooks" ]; then
-      add_block "$(cat <<BLOCK
-    "SubagentStart": [
-      {
-        "hooks": [
-$subagent_hooks
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-$subagent_hooks
-        ]
-      }
-    ]
-BLOCK
-)"
-    fi
-
-    printf '%s\n' "$all_blocks"
-
-    echo "  }"
+    echo "warning: cross-provider routing sends eligible work to the agy-worker subagent, which"
+    echo "  dispatches through ~/.claude/scripts/gemini-dispatch.sh — re-run and also select"
+    echo "  'Gemini dispatch', or drop ROUTE_ENFORCE so routing stays advisory."
   fi
 
   cat <<'FOOTER'
 
-See examples/settings.json for a complete snippet.
+See examples/settings.json for a complete snippet (every component selected).
+Upgrading from an earlier install? See README § "Upgrading from an earlier install".
 
 If Claude Code is already running, restart it to pick up the new statusline
 and hook registrations.

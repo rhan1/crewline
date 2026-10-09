@@ -48,7 +48,9 @@ The installer:
 1. Prompts once per optional component — accept the default (Y) to match the author's setup, or decline to skip. Pass `--all` to skip prompts and install everything, or `--minimal` to install only the statusline.
 2. Backs up any existing `~/.claude/statusline.sh`, `~/.claude/scripts/`, `~/.claude/commands/`, and `~/.claude/hooks/` targets to `~/.claude/backups/pre-install-<ts>/`
 3. Symlinks this repo's files into `~/.claude/` (so `git pull` upgrades everything)
-4. Prints the settings.json snippet for only the components you installed
+4. Prints the settings.json snippet for only the components you installed (one complete JSON object between `BEGIN`/`END crewline settings snippet` lines)
+
+**Non-interactive install** (scripts, CI): `CREWLINE_COMPONENTS="0,1,4,8" ./install.sh --copy` installs exactly the listed component indexes, skips every prompt (including the model wizard), and still prints the snippet. Indexes: 0 Codex dispatch, 1 Gemini dispatch, 2 budget check, 3 execute-at-reset, 4 RuFlo, 5 log rotation, 6 `/agents` monitor, 7 burn-rate advisor, 8 cross-provider routing, 9 executor tabs.
 
 **Manual install** — if you'd rather see what's going on:
 
@@ -62,6 +64,17 @@ chmod +x ~/.claude/statusline.sh ~/.claude/scripts/*.sh
 ```
 
 Then merge `examples/settings.json` into `~/.claude/settings.json`.
+
+### Upgrading from an earlier install
+
+Earlier versions shipped an advisory `agy-router.js` hook that only *suggested* Antigravity. Routing is now enforced (see **How a subagent call is routed**). To upgrade:
+
+1. `git pull` in your crewline clone.
+2. `./install.sh` and re-select your components (say yes to "Cross-provider routing" and "Gemini dispatch").
+3. In `~/.claude/settings.json`, delete the `PreToolUse` entry running `node ~/.claude/hooks/agy-router.js` and the old `~/.claude/hooks/agy-router.js` file.
+4. In the same file, replace the `Agent` `PreToolUse` entry running `ruflo-model-enforcer.js` with `node ~/.claude/hooks/route-chain.js`, add `node ~/.claude/hooks/agy-worker-audit.js` under `SubagentStop`, and add `"env": {"ROUTE_ENFORCE": "1"}`.
+5. Restart Claude Code.
+6. Run `/balance` and confirm every provider row is present (Claude 5h/7d, Codex, Codex weekly, agy 5h/weekly) and none is listed under `STALE`.
 
 ## Slash commands
 
@@ -86,8 +99,10 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `burn-rate-advisor.js` | `UserPromptSubmit` + `PreToolUse (Agent\|Workflow)` | Grades **budget left vs clock left** (`surplus = budget_left% − clock_left%`). 5h budget does not roll over, so when the window is about to reset with a lot unspent it says **SPRINT** — fan out to maximum useful width, breadth over depth, push mechanical work to external CLI executors. When burning faster than the clock it says **CONSERVE**/**CRITICAL** — sequential, cheapest tier, checkpoint and chain to the next window. **Silent when on pace**, and silent at the fan-out decision point unless the posture is actionable. A high 7d reading tempers or cancels a sprint, since the weekly window does not refill. |
 | `auto-budget-check.js` | `UserPromptSubmit` | Scans each prompt for execution-intent keywords (execute, implement, deploy, refactor…). If matched AND 5h usage ≥40%, injects a `[auto-budget]` advisory into the context so Claude sees it before starting. Escalates to 🚨 at ≥80%. |
 | `weekly-maintenance.js` | `SessionStart` | Once per 7 days, rotates dispatch logs older than 30 days and refreshes the Gemini model cache. Runs in background (`child.unref()`) so session startup is never blocked. |
-| `ruflo-model-enforcer.js` | `PreToolUse` (Agent) | Optional. See below. |
-| `agy-router.js` | `PreToolUse` (Agent) | Optional. Pushes eligible subagent work onto Antigravity (Gemini) instead of a Claude tier, so it bills the provider you are *not* exhausting. See **Cross-provider balancing** below. |
+| `ruflo-model-enforcer.js` | `PreToolUse` (Agent), or via `route-chain.js` | Optional. See below. |
+| `route-chain.js` | `PreToolUse` (Agent) | Installed with cross-provider routing. The ONE rewriting `Agent` hook: runs `route-resolver.js`, and if that doesn't send the call to Antigravity, runs `ruflo-model-enforcer.js` (when installed) for the Claude tier. Claude Code runs PreToolUse hooks in parallel and keeps only one `updatedInput`, so the two must not be separate entries. |
+| `route-resolver.js` | called by `route-chain.js` | Decides Claude vs Antigravity for each subagent call: capability blockers first, then live capacity from `/balance`. Rewrites the call to `agy-worker` when `ROUTE_ENFORCE=1`. See **How a subagent call is routed** below. |
+| `agy-worker-audit.js` | `SubagentStop` | When an `agy-worker` stops, checks that it really ran `gemini-dispatch.sh` (transcript + a fresh `gemini-*.log`). Otherwise it posts a `VIOLATION` line: the work ran on Claude tokens. |
 
 ## Cross-provider balancing
 
@@ -95,7 +110,7 @@ RuFlo answers "which Claude tier?" These two answer the question one level up: *
 
 ### `/balance` and `scripts/quota-balance.mjs`
 
-Reads every provider's quota cache in one place — Claude 5h + 7d, Codex weekly, Gemini/agy 5h + weekly — and scores each on a single signed number:
+Reads every provider's quota cache in one place — Claude 5h + 7d, Codex 5h + weekly, Gemini/agy 5h + weekly — and scores each on a single signed number:
 
 ```
 surplus = (% budget left) − (% of window still to come)
@@ -110,17 +125,39 @@ Two rules fall out of it, and both exist because of a real failure: one provider
 
 Capability still decides who *can* do a job (no browser driving on agy, no VPN-gated DB from a sandboxed executor). Among those that can, surplus decides who *should*.
 
-### `agy-router.js` + `agents/agy-worker.md`
+### How a subagent call is routed
 
-Unconditional rules like "mechanical work goes to executor X" are what drain a single provider dry. This pair makes the choice conditional and automatic.
+Unconditional rules like "mechanical work goes to executor X" are what drain a single provider dry. Every `Agent` call goes through `route-chain.js`, which applies this ladder in order:
 
-`agy-router.js` classifies each `Agent` call and, when the profile is clearly Gemini-eligible, advises routing to the `agy-worker` subagent instead of a Claude tier. Eligible: codebase exploration and file-reading research, mechanical code, batch work, long-context reads, test generation, first-pass drafts. Disqualified: browser driving, VPN/credential-gated data work, MCP-tool tasks, security judgment, anything interactive, and very short asks where writing the spec costs more than doing the work.
+1. **Capability blockers → Claude.** Browser driving, DB/VPN/credential work, MCP tools, security review, anything interactive, and an explicit `model:` on a judgment task (review, verify, audit, plan, adversarial…) stay on Claude. A negated mention ("no browser needed") is not a blocker.
+2. **agy-eligibility.** The task must hit at least one fitness signal (exploration/file-reading, mechanical code, batch, long-context read) AND the prompt must be ≥ 200 chars. Otherwise it stays on Claude.
+3. **Capacity from `/balance`.** agy weekly or 5h in floor breach or `EXHAUSTED` → Claude. Claude 7d in `SPEND` with surplus ≥ agy weekly surplus + 20, and agy weekly not `SPEND`/`SPRINT`/`IDLE` → Claude (use-or-lose). Otherwise → `agy-worker`.
+4. **Enforcement.** With `ROUTE_ENFORCE=1` the call is rewritten to `subagent_type: "agy-worker"`. Unset, the hook only adds a one-line `[route] …` advisory.
+5. **Claude tier.** Whatever stays on Claude goes to RuFlo (`ruflo-model-enforcer.js`), which picks haiku/sonnet/opus.
+6. **Audit.** `agy-worker-audit.js` flags an `agy-worker` that did the work itself on Claude tokens instead of dispatching.
 
-`agents/agy-worker.md` is a thin dispatcher subagent: it specs the task, dispatches via `gemini-dispatch.sh`, liveness-checks the log, and — critically — **verifies the deliverable exists and parses before reporting success.** Antigravity has a documented failure mode where it returns a detailed, confident success narrative for a file it never wrote, so "it said it worked" is not evidence.
+`agents/agy-worker.md` is a thin dispatcher subagent pinned to `model: haiku` with only the Bash tool. It writes the spec, runs `gemini-dispatch.sh` in the foreground, and **verifies the deliverable exists and parses before reporting success.** Antigravity has a documented failure mode where it returns a detailed, confident success narrative for a file it never wrote, so "it said it worked" is not evidence.
+
+**Kill switches.** `ROUTE_RESOLVER_OFF=1` disables the resolver entirely (route-chain then only runs RuFlo). Removing `ROUTE_ENFORCE` keeps routing advisory. `AGY_ROUTER_OFF` no longer exists: the old `agy-router.js` hook is gone, so delete it if an earlier install left it behind (see **Upgrading from an earlier install**).
+
+**Decision log.** Every routing decision is appended to `~/.claude/route-decisions.jsonl` (hits, blocker, capacity snapshot, decision, reason, enforced). Audit results go to `~/.claude/route-violations.jsonl`.
+
+**What `/balance` reads, and who writes it:**
+
+| Cache | Written by |
+|---|---|
+| `~/.claude/.session-state.json` (Claude 5h + 7d) | `statusline.sh`, every render |
+| `~/.claude/codex-rate-limits.json` (Codex 5h + weekly) | `scripts/codex-rate-limits-refresh.mjs`, kicked by `statusline.sh` when stale |
+| `~/.claude/agy-quota.json` (agy 5h + weekly) | `scripts/agy-quota-refresh.sh`, kicked by `statusline.sh` when stale (installed with cross-provider routing) |
+| `~/.claude/ollama-quota.json` (optional) | nothing in this repo. Ollama Cloud rows only render if you supply your own refresher. |
+
+**Stale and IDLE.** A cache older than 6h, or a window whose reset time has already passed, is dropped from the table and listed under `STALE` (`stale` in `--json`). Consumers treat a missing row as unknown, not as live data. agy and Codex windows are anchored on first use, so an untouched window reads as `IDLE`: surplus = left% − floor (≈ +85), and it never loses the use-or-lose tie-break. Codex shows two rows, `Codex` (5h) and `Codex weekly`.
+
+**Wrapper floor gate.** `codex-dispatch.sh` and `gemini-dispatch.sh` call `dc_quota_gate` before building a prompt or writing any status file. A fresh `/balance` reading of `EXHAUSTED` or floor breach for that provider refuses the dispatch with exit code `3`. Missing, stale or unparseable quota data fails **open** (the dispatch proceeds). `DISPATCH_FORCE=1` overrides.
+
+**Reserved Codex tiers.** `CODEX_TIER=max` / `algo` (GPT-6 Astra) are for architect-level planning/review and need `CODEX_ALLOW_RESERVED=1`; without it the wrapper exits `2`. `CODEX_SERVICE_TIER` accepts only `default` (`flex` is dead server-side, `priority` costs extra without buying quota).
 
 **Dispatch threshold.** The common ">60 lines" heuristic assumes you are trading one paid quota for another. When the target provider's quota is effectively free, the only cost is spec-writing plus verification, so the threshold drops: dispatch when **the spec is shorter than the work** — roughly 30+ lines of output, 3+ files to read, or any repeated/batch task. Exploration almost always qualifies, since one sentence of spec buys a large pile of reading.
-
-Disable either with `AGY_ROUTER_OFF=1`.
 
 ### Codex tiers (`scripts/codex-dispatch.sh`)
 
@@ -131,10 +168,10 @@ Every Codex dispatch is routed to a tier instead of inheriting the global `~/.co
 | `lite` | `gpt-6-luna` | low | classifier complexity < 20% — renames, typos, boilerplate |
 | `std` | `gpt-5.6-terra` | high | 20–42% — most mechanical code (no GPT-6 Terra exists yet) |
 | `high` | `gpt-6-sol` | high | ≥ 42% — hard mechanical builds; the auto-route ceiling |
-| `max` | `gpt-6-astra` | high | `CODEX_TIER=max` only — audits, planning review |
-| `algo` | `gpt-6-astra` | ultra | `CODEX_TIER=algo` only — genuinely algorithmic specs |
+| `max` | `gpt-6-astra` | high | `CODEX_TIER=max` + `CODEX_ALLOW_RESERVED=1` only — audits, planning review |
+| `algo` | `gpt-6-astra` | ultra | `CODEX_TIER=algo` + `CODEX_ALLOW_RESERVED=1` only — genuinely algorithmic specs |
 
-Auto-classification uses the `ruflo` CLI's complexity score when it is on PATH; without it every dispatch lands on `std` (never `max`, so a missing classifier cannot silently restore full-price dispatching). `CODEX_ROUTER=off` inherits `config.toml`; `CODEX_MODEL` / `CODEX_EFFORT` / `CODEX_SERVICE_TIER` override single knobs. The tier, route source and service tier are written to `codex-last.json` and echoed as a `[CodexRoute]` line at the top of every dispatch log.
+Auto-classification uses the `ruflo` CLI's complexity score when it is on PATH; without it every dispatch lands on `std` (never `max`, so a missing classifier cannot silently restore full-price dispatching). `CODEX_ROUTER=off` inherits `config.toml`; `CODEX_MODEL` / `CODEX_EFFORT` override single knobs (`CODEX_SERVICE_TIER` accepts only `default`). The tier, route source and service tier are written to `codex-last.json` and echoed as a `[CodexRoute]` line at the top of every dispatch log.
 
 Service tier is always `default`: OpenAI removed `flex` on 2026-09-29 (every model now returns `400 Unsupported service_tier: flex`), and `priority` buys latency, not quota.
 
@@ -161,9 +198,13 @@ And a third, about the instrument itself: measure quality separately from correc
 
 ### RuFlo (model routing)
 
-`hooks/ruflo-model-enforcer.js` fires on every `Agent` tool call and rewrites the `model` parameter to the cheapest tier that fits the task. It uses keyword heuristics — no external CLI, no network calls, no LLM inference. The whole thing is ~120 lines of Node.js with no dependencies.
+`hooks/ruflo-model-enforcer.js` fires on every `Agent` tool call and rewrites the `model` parameter to the cheapest tier that fits the task. It uses keyword heuristics — no external CLI, no network calls, no LLM inference. It is a single Node.js file with no dependencies. With cross-provider routing installed it is called by `route-chain.js` instead of being wired directly.
 
 **How it works:** the hook scores the agent's `description` field against three keyword lists (haiku / sonnet / opus). Longer descriptions get a small complexity boost toward opus. When the winning tier beats a 0.5 confidence threshold, the hook either confirms the chosen model (AGREE) or swaps it (REWRITE). Below threshold it passes through without touching anything.
+
+**Never rewritten:** an agent whose definition pins a model (`model:` in `~/.claude/agents/<type>.md` frontmatter, e.g. `agy-worker` → haiku) when the call names no model; and a call that names a model explicitly on a judgment task (review, verify, audit, plan, adversarial — same regex as `route-resolver.js`).
+
+**Fable fallback:** when the hook has no verdict and the call names no model, the subagent would inherit the parent session's tier. If the statusline's `~/.claude/.session-state.json` says the session runs a Fable-tier model, the call is routed to `FABLE_INHERIT_FALLBACK` (default `opus`) instead.
 
 **Writes:** `~/.claude/hooks/ruflo-last-route.txt` — a one-line record of the last routing decision, consumed by the statusline. `~/.claude/hooks/ruflo-enforcer.log` — append-only log of every firing.
 

@@ -1,14 +1,15 @@
 {
-  "_comment_about_this_file": "Example snippet showing how to wire the statusline and hooks into ~/.claude/settings.json. Merge these sections into your existing settings.json — don't blindly overwrite. The install.sh script does this merge safely.",
-  "_comment_ruflo": "Remove the PreToolUse block if you skipped RuFlo during install.",
-
+  "_comment_about_this_file": "Example snippet showing how to wire the statusline and hooks into ~/.claude/settings.json with EVERY component selected. Merge these sections into your existing settings.json — do not blindly overwrite. ./install.sh prints the exact snippet for the components you chose.",
+  "_comment_routing": "With cross-provider routing installed, route-chain.js is the only Agent PreToolUse hook (it runs route-resolver.js, then ruflo-model-enforcer.js). Without routing, wire node ~/.claude/hooks/ruflo-model-enforcer.js there instead. Remove env.ROUTE_ENFORCE to keep routing advisory.",
   "statusLine": {
     "type": "command",
     "command": "bash ~/.claude/statusline.sh",
     "padding": 2,
     "refreshInterval": 10
   },
-
+  "env": {
+    "ROUTE_ENFORCE": "1"
+  },
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -16,6 +17,10 @@
           {
             "type": "command",
             "command": "node ~/.claude/hooks/auto-budget-check.js"
+          },
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/burn-rate-advisor.js"
           }
         ]
       }
@@ -26,7 +31,16 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ~/.claude/hooks/ruflo-model-enforcer.js"
+            "command": "node ~/.claude/hooks/route-chain.js"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/burn-rate-advisor.js"
           }
         ]
       }
@@ -37,6 +51,30 @@
           {
             "type": "command",
             "command": "node ~/.claude/hooks/weekly-maintenance.js"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/agent-activity-log.js"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/agent-activity-log.js"
+          },
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/agy-worker-audit.js"
           }
         ]
       }

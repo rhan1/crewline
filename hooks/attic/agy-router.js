@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+// ATTIC — superseded on 2026-10-10 by hooks/route-resolver.js + hooks/route-chain.js (enforced routing).
+// Kept for reference only; not installed by install.sh and not wired in any settings snippet.
+// To remove an old install: delete its PreToolUse entry from ~/.claude/settings.json (see README § Upgrading).
 /**
  * agy-router — PreToolUse:Agent advisory that pushes eligible work onto Antigravity.
  *

@@ -60,7 +60,7 @@ function assess() {
   try { st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return null; }
 
   const now = Math.floor(Date.now() / 1000);
-  if (typeof st.timestamp === 'number' && (now - st.timestamp) > STALE_AFTER) return null;
+  if (typeof st.timestamp !== 'number' || (now - st.timestamp) > STALE_AFTER || st.timestamp > now + 300) return null;
 
   const five = (st.rate_limits || {}).five_hour || {};
   const weekly = (st.rate_limits || {}).seven_day || (st.rate_limits || {}).weekly || {};

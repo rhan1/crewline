@@ -9,8 +9,16 @@
 #   *.json  — manifest with { "prompt": "...", "attachments": ["/path/a.png", ...] }.
 #             Rendered as a single prompt with @path references appended inline.
 #
+# Output format (2026-09-06): agy runs with --output-format stream-json so it emits one
+# NDJSON event per step (init / step_update / result) WHILE it works. The watchdog in
+# dispatch-common.sh measures log growth; when agy printed nothing until completion,
+# every healthy run longer than AGY_STALL_MINS was killed as "stalled". The final
+# {"event":"result","result":{...}} line carries the result object (conversation_id,
+# status, response, duration_seconds, num_turns, usage); chars_out is measured on THAT
+# object, falling back to the whole capture if no result line is found.
+#
 # Writes:
-#   ~/.claude/logs/gemini-<ISO>.log  — full stdout+stderr of gemini run
+#   ~/.claude/logs/gemini-<ISO>.log  — full stdout+stderr of agy run (NDJSON stream)
 #   ~/.claude/gemini-last.json       — { timestamp, task_name, elapsed_s,
 #                                        status, exit_code, spec_path,
 #                                        log_path, chars_out, attachments }
@@ -33,6 +41,11 @@ if [ -z "$SPEC_FILE" ] || [ ! -f "$SPEC_FILE" ]; then
   echo "error: spec file missing or unreadable: $SPEC_FILE" >&2
   exit 2
 fi
+
+# Floor gate (dispatch-common.sh dc_quota_gate) — refuse before any prompt building or
+# status write, so a refused dispatch leaves gemini-last.json untouched and the statusline
+# never shows a run that did not happen. Exit 3 = refused. DISPATCH_FORCE=1 overrides.
+dc_quota_gate '^agy (5h|weekly)$' "$HOME/.claude/agy-quota.json" || exit $?
 
 CLAUDE_DIR="$HOME/.claude"
 LOG_DIR="$CLAUDE_DIR/logs"
@@ -146,7 +159,7 @@ AGY_BIN="$(command -v agy 2>/dev/null || true)"
 AGY_MODEL="${AGY_MODEL:-}"
 AGY_EFFORT="${AGY_EFFORT:-high}"
 
-AGY_ARGS=(--dangerously-skip-permissions --print-timeout "$AGY_PRINT_TIMEOUT")
+AGY_ARGS=(--dangerously-skip-permissions --print-timeout "$AGY_PRINT_TIMEOUT" --output-format stream-json)
 [ -n "$AGY_MODEL" ] && AGY_ARGS+=(--model "$AGY_MODEL")
 
 # --effort is REJECTED outright for models whose thinking is built in (verified 2026-08-18:
@@ -209,7 +222,49 @@ END_EPOCH="$(dc_now)"
 ELAPSED="$(dc_elapsed "$START_EPOCH" "$END_EPOCH")"
 WATCHDOG_STATUS="$(tr -d '\r\n' < "$STATUS_FILE")"
 
-CHARS_OUT="$(wc -c < "$CAPTURE_FILE" | tr -d ' ')"
+# ── Result extraction (stream-json) ──────────────────────────────────────────
+# Pull the LAST {"event":"result",...} line out of the NDJSON stream and write its
+# inner `result` object to RESULT_FILE. chars_out reads RESULT_FILE when present;
+# when no result line exists (killed run, old format, malformed stream) it falls back
+# to the whole capture so a parse miss can never turn a successful run into chars_out=0.
+RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/gemini-dispatch-result.XXXXXX")" || RESULT_FILE=""
+RESULT_FOUND=0
+if [ -n "$RESULT_FILE" ]; then
+  python3 - "$CAPTURE_FILE" "$RESULT_FILE" 2>>"$LOG_FILE" <<'PYRES'
+import json, sys
+result = None
+try:
+    with open(sys.argv[1], "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("event") == "result" and isinstance(obj.get("result"), dict):
+                result = obj["result"]          # stream-json: keep the LAST one
+            elif "event" not in obj and isinstance(obj.get("usage"), dict):
+                result = obj                    # legacy `json` format: whole object
+except OSError:
+    pass
+if result is None:
+    sys.exit(1)
+with open(sys.argv[2], "w") as out:
+    out.write(json.dumps(result))
+PYRES
+  [ $? -eq 0 ] && [ -s "$RESULT_FILE" ] && RESULT_FOUND=1
+fi
+
+if [ "$RESULT_FOUND" -eq 1 ]; then
+  CHARS_OUT="$(wc -c < "$RESULT_FILE" | tr -d ' ')"
+else
+  CHARS_OUT="$(wc -c < "$CAPTURE_FILE" | tr -d ' ')"
+  echo 'note: no {"event":"result"} line in agy stream — chars_out falls back to whole capture' | tee -a "$LOG_FILE"
+fi
 
 case "$WATCHDOG_STATUS" in
   stalled)
@@ -241,7 +296,7 @@ CHARS_OUT="$CHARS_OUT" ATTACHMENT_COUNT="$ATTACHMENT_COUNT" \
 EXECUTOR_USED="$EXECUTOR_USED" \
 dc_write_last_json "$LAST_JSON" gemini
 
-rm -f "$STATUS_FILE" "$CAPTURE_FILE"
+rm -f "$STATUS_FILE" "$CAPTURE_FILE" ${RESULT_FILE:+"$RESULT_FILE"}
 
 {
   echo ""
