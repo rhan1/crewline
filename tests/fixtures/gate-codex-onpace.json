@@ -1,0 +1,20 @@
+{
+  "rows": [
+    {
+      "label": "Codex",
+      "leftPct": 60,
+      "usedPct": 40,
+      "state": "ON PACE",
+      "floorBreach": false,
+      "resetsIn": "1d 2h"
+    },
+    {
+      "label": "Codex weekly",
+      "leftPct": 70,
+      "usedPct": 30,
+      "state": "ON PACE",
+      "floorBreach": false,
+      "resetsIn": "4d"
+    }
+  ]
+}

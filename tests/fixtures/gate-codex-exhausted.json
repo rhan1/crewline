@@ -1,0 +1,12 @@
+{
+  "rows": [
+    {
+      "label": "Codex",
+      "leftPct": 1,
+      "usedPct": 99,
+      "state": "EXHAUSTED",
+      "floorBreach": false,
+      "resetsIn": "1d 2h"
+    }
+  ]
+}

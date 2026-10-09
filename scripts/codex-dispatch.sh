@@ -29,6 +29,30 @@ if [ -z "$SPEC_FILE" ] || [ ! -f "$SPEC_FILE" ]; then
   exit 2
 fi
 
+# Reserved-tier / service-tier guard (2026-10-08) — refuse before the quota gate, routing or
+# any status write. max/algo (gpt-6-astra) are reserved for architect-level planning/review, so a
+# forced max/algo needs an explicit CODEX_ALLOW_RESERVED=1. service_tier is `default` only: flex
+# 400s server-side since 2026-09-29 and priority costs extra without buying quota.
+case "${CODEX_TIER:-}" in
+  max|algo)
+    if [ "${CODEX_ALLOW_RESERVED:-}" != "1" ]; then
+      echo "codex-dispatch: tier ${CODEX_TIER} is reserved for architect-level planning/review; set CODEX_ALLOW_RESERVED=1 to confirm" >&2
+      exit 2
+    fi ;;
+esac
+case "${CODEX_SERVICE_TIER:-}" in
+  ""|default) ;;
+  *)
+    echo "codex-dispatch: CODEX_SERVICE_TIER='${CODEX_SERVICE_TIER}' refused — only 'default' is allowed (flex is dead server-side, priority is never worth paying)" >&2
+    exit 2 ;;
+esac
+
+# Floor gate (dispatch-common.sh dc_quota_gate) — refuse before any tier routing, prompt
+# building or status write, so a refused dispatch leaves codex-last.json untouched and the
+# statusline never shows a run that did not happen. Exit 3 = refused. Gates both the 5h
+# ("Codex") and weekly ("Codex weekly") windows from /balance.
+dc_quota_gate '^Codex( weekly)?$' "$HOME/.claude/codex-rate-limits.json" || exit $?
+
 CLAUDE_DIR="$HOME/.claude"
 LOG_DIR="$CLAUDE_DIR/logs"
 mkdir -p "$LOG_DIR"
@@ -42,6 +66,8 @@ mkdir -p "$LOG_DIR"
 #   CODEX_TIER=lite|std|high|max|algo
 #                             force a tier, skip classification. `max`/`algo`
 #                             (GPT-6 Astra) are never chosen automatically.
+#                             They also need CODEX_ALLOW_RESERVED=1 (guard above).
+#   DISPATCH_FORCE=1          bypass the quota floor gate
 #   CODEX_ROUTER=off          disable routing entirely (naked invocation =
 #                             whatever ~/.codex/config.toml says)
 #   CODEX_MODEL / CODEX_EFFORT / CODEX_SERVICE_TIER
@@ -227,7 +253,9 @@ case "$MODEL" in (*[!A-Za-z0-9._-]*|"") MODEL="unknown" ;; esac
 
 # Capture reasoning effort from the "reasoning effort: <level>" line (default: none).
 REASONING="$(grep -m1 -aE '^reasoning effort:[[:space:]]' "$LOG_FILE" 2>/dev/null | awk '{print $3}')"
-case "$REASONING" in (minimal|low|medium|high|xhigh|ultra|none) ;; (*) REASONING="none" ;; esac
+# Allowlist matches what the 5.6/6 family accepts: none|low|medium|high|xhigh|max, plus
+# `ultra` on sol/astra. `minimal` is rejected upstream with a 400, so it never appears here.
+case "$REASONING" in (low|medium|high|xhigh|max|ultra|none) ;; (*) REASONING="none" ;; esac
 
 case "$WATCHDOG_STATUS" in
   stalled)

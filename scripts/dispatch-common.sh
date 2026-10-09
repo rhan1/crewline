@@ -288,3 +288,85 @@ dc_tree_revert() {
     esac
   done <<< "$changes"
 }
+
+# ── Quota floor gate (F5-A, 2026-09-06) ──────────────────────────────────────
+# dc_quota_gate <label-regex> <cache-file> — refuse the dispatch when the target
+# provider is EXHAUSTED or below its floor. Returns 0 to proceed, 3 to refuse.
+#
+# The floor rule existed as advice since 2026-08-16 and was breached twice
+# (Codex hit 100% on 07-29 and 08-16; on 09-06 it took 19 more jobs at 5% left).
+# Advice in a rulebook cannot hold a budget — only the wrapper can, because it
+# is the last thing between an intent to dispatch and the spend.
+#
+# Fails OPEN by design on missing/unparseable data or a stale cache: a broken
+# quota reader must never be able to block real work. It only ever refuses on
+# a positive, fresh reading of EXHAUSTED / floorBreach.
+#
+#   DISPATCH_FORCE=1       bypass entirely (the documented override)
+#   DISPATCH_GATE_JSON     path to a fixture with the quota-balance --json shape;
+#                          when set it REPLACES the live reader AND the cache
+#                          staleness check (the fixture is the source of truth,
+#                          otherwise a stale real cache would fail every probe open).
+dc_quota_gate() {
+  local label_re="${1:-}" cache="${2:-}" json="" verdict="" prc=0 age=0
+
+  if [ "${DISPATCH_FORCE:-}" = "1" ]; then
+    echo "quota gate: bypassed by DISPATCH_FORCE=1" >&2
+    return 0
+  fi
+  [ -n "$label_re" ] || return 0
+  command -v python3 >/dev/null 2>&1 || { echo "quota gate: stale/unavailable — failing OPEN" >&2; return 0; }
+
+  if [ -n "${DISPATCH_GATE_JSON:-}" ]; then
+    [ -f "${DISPATCH_GATE_JSON}" ] || { echo "quota gate: stale/unavailable — failing OPEN" >&2; return 0; }
+    json="$(cat "${DISPATCH_GATE_JSON}" 2>/dev/null)"
+  else
+    if [ -n "$cache" ]; then
+      if [ ! -f "$cache" ]; then
+        echo "quota gate: stale/unavailable — failing OPEN" >&2
+        return 0
+      fi
+      age="$(( $(dc_now) - $(stat -f %m "$cache" 2>/dev/null || printf '0') ))"
+      if [ "$age" -gt 21600 ]; then
+        echo "quota gate: stale/unavailable — failing OPEN" >&2
+        return 0
+      fi
+    fi
+    json="$(dc_timeout 10 node "$HOME/.claude/scripts/quota-balance.mjs" --json 2>/dev/null)"
+  fi
+
+  [ -n "$json" ] || { echo "quota gate: stale/unavailable — failing OPEN" >&2; return 0; }
+
+  verdict="$(DC_GATE_JSON="$json" DC_GATE_RE="$label_re" python3 - <<'PY'
+import json, os, re, sys
+try:
+    rows = json.loads(os.environ.get("DC_GATE_JSON") or "").get("rows") or []
+except Exception:
+    sys.exit(2)                      # unparseable -> caller fails OPEN
+try:
+    rx = re.compile(os.environ["DC_GATE_RE"])
+except Exception:
+    sys.exit(2)
+for r in rows:
+    if not isinstance(r, dict) or not rx.search(str(r.get("label", ""))):
+        continue
+    if r.get("state") == "EXHAUSTED" or r.get("floorBreach") is True:
+        print("%s\t%s\t%s\t%s" % (r.get("label"), r.get("leftPct"),
+                                  r.get("state"), r.get("resetsIn")))
+        sys.exit(0)                  # positive refusal
+sys.exit(1)                          # nothing refusing
+PY
+)"
+  prc=$?
+
+  if [ "$prc" -eq 2 ] || { [ "$prc" -eq 0 ] && [ -z "$verdict" ]; }; then
+    echo "quota gate: stale/unavailable — failing OPEN" >&2
+    return 0
+  fi
+  [ "$prc" -eq 0 ] || return 0
+
+  local g_label g_left g_state g_reset
+  IFS=$'\t' read -r g_label g_left g_state g_reset <<< "$verdict"
+  echo "quota gate: REFUSED — ${g_label} ${g_left}% left, ${g_state}, resets in ${g_reset}. Set DISPATCH_FORCE=1 to override." >&2
+  return 3
+}
