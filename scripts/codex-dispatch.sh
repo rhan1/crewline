@@ -170,6 +170,10 @@ LAST_JSON="$CLAUDE_DIR/codex-last.json"
 
 START_EPOCH="$(dc_now)"
 
+# Running-job record for the dispatch-band mod (mods/dispatch-band); removed on any exit.
+dc_running_mark codex "$TASK_NAME" "${TIER_MODEL:-unknown}" "${TIER:-}" || true
+trap 'rc=$?; dc_running_clear codex "$TASK_NAME"; exit $rc' EXIT
+
 # Snapshot the tree so we can report afterwards whether this dispatch actually
 # wrote anything (see dispatch-common.sh). Detection is free and always on.
 WORK_DIR="${CODEX_WORK_DIR:-$PWD}"

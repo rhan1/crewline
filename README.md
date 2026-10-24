@@ -260,6 +260,34 @@ Use it at the plan→execute boundary, for anything running longer than ~15–20
 minutes, or for a second concurrent workstream. Don't use it for planning,
 review, or small delegations — a subagent already handles those more cheaply.
 
+## Add-on: dispatch band (Claude Code mod)
+
+A live strip just above the prompt with one line per Codex / Gemini job **this Claude session** dispatched through `codex-dispatch.sh` or `gemini-dispatch.sh`:
+
+```
+  ◼ refactor loaders            ← Claude's own task list stays above, one blank line between
+
+dispatches 3 running in this session · 2 codex · 1 gemini
+◆ api-review          ▂▂▂▃▄▃▂▃▃▂▂▃▃▃▅▆   working               5m $ pytest tests/api -q        12 files · 18 pass
+◆ schema-migrate      ▃▂▂▂▂▄▅▄▅▅▄▄▆▆▄▁ ◎ 3/5 backfill rows      2m $ psql -f migrate/003.sql
+◇ docs-sweep          ▁▁▁▁▁▁▂▃▅▆▆▅▄▅▆▅   working               1m read_file docs/index.md
+```
+
+- **Activity graph**: how much the job's log grew over the last ~80 s, one scale for every row.
+- **Stage dots**: done ●, current ◎ (pulses while the job works), to-do ○ — read from `PROGRESS n/m start|done <name>` lines the executor prints. No such lines → no dots (never an invented stage).
+- **Now**: the command / file the job is touching this second, plus files changed and tests passing.
+- A job with no new output for 3 min stops moving and turns amber (`quiet 4m`).
+- Only this session's jobs: each record carries the launching session's `CLAUDE_PID`.
+
+Install (Claude Code with mods support):
+
+```bash
+claude plugin marketplace add rhan1/crewline
+claude plugin install dispatch-band@crewline
+```
+
+Then `/reload-plugins` in open sessions. Toggle with `/dispatches on` / `/dispatches off`. It needs the crewline dispatch wrappers (they write `~/.claude/run-status/dispatch-running/*.json` while a job runs and remove it on exit) and `python3`. Source: [`mods/dispatch-band`](mods/dispatch-band) — `claude plugin test mods/dispatch-band` runs its tests.
+
 ## Statusline
 
 Writes `~/.claude/.session-state.json` on every tick (every ~10s). This file is the ground truth for `/budget-check`, `/execute-at-reset`, and `auto-budget-check.js` — the statusline is the only component that actually sees Claude Code's rate-limit data, so it mirrors it into a file the other components can read.

@@ -107,6 +107,10 @@ esac
 
 START_EPOCH="$(dc_now)"
 
+# Running-job record for the dispatch-band mod (mods/dispatch-band); removed on any exit.
+dc_running_mark agy "$TASK_NAME" "${AGY_MODEL:-default}" "high" || true
+trap 'rc=$?; dc_running_clear agy "$TASK_NAME"; exit $rc' EXIT
+
 # ── Executor resolution ──────────────────────────────────────────────────────
 # Antigravity CLI (`agy`) is the SOLE executor as of the 2026-05-29 cutover.
 # Gemini CLI is retired and is no longer an available fallback.

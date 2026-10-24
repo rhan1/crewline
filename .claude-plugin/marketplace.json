@@ -1,0 +1,7 @@
+{
+  "name": "crewline",
+  "owner": { "name": "crewline" },
+  "plugins": [
+    { "name": "dispatch-band", "source": "./mods/dispatch-band", "description": "Live one-line view of the Codex/Gemini jobs this Claude session dispatched (needs crewline's codex-dispatch.sh / gemini-dispatch.sh)" }
+  ]
+}
