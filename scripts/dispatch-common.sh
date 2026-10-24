@@ -370,3 +370,31 @@ PY
   echo "quota gate: REFUSED — ${g_label} ${g_left}% left, ${g_state}, resets in ${g_reset}. Set DISPATCH_FORCE=1 to override." >&2
   return 3
 }
+
+# ── Running-job records (read by the dispatch-band mod, mods/dispatch-band) ─────
+# One JSON file per running dispatch in ~/.claude/run-status/dispatch-running/:
+# executor, task, model, start time, wrapper pid, log, spec, and parent_pid = the
+# Claude session that launched it (Claude Code exports CLAUDE_PID to its children),
+# so each session's band shows only its own jobs. The wrapper clears it on exit.
+dc_running_mark() {
+  local executor="${1:-}" task="${2:-}" model="${3:-}" tier="${4:-}"
+  [ -n "$executor" ] && [ -n "$task" ] || return 0
+  local dir="$HOME/.claude/run-status/dispatch-running" parent="null" spec="${SPEC_FILE:-}" profile tmp
+  mkdir -p "$dir" 2>/dev/null || return 0
+  [[ "${CLAUDE_PID:-}" =~ ^[0-9]+$ ]] && parent="$CLAUDE_PID"
+  [ -n "$spec" ] && [ "${spec#/}" = "$spec" ] && spec="$PWD/$spec"
+  spec="$(printf '%s' "$spec" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  profile="$(printf '%s' "${CODEX_HOME:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  tmp="$dir/.${executor}-${task}.tmp.$$"
+  printf '{"executor":"%s","task":"%s","model":"%s","tier":"%s","started":%s,"pid":%s,"log":"%s","parent_pid":%s,"spec":"%s","profile":"%s"}\n' \
+    "$executor" "$task" "$model" "$tier" "$(dc_now)" "$$" "${LOG_FILE:-}" "$parent" "$spec" "$profile" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$dir/${executor}-${task}.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+dc_running_clear() {
+  local f="$HOME/.claude/run-status/dispatch-running/${1:-}-${2:-}.json"
+  # only our own record: a later dispatch with the same task name may own the file now
+  [ -f "$f" ] && grep -q "\"pid\":$$," "$f" 2>/dev/null && rm -f "$f"
+  return 0
+}

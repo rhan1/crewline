@@ -1,0 +1,8 @@
+{
+  "name": "dispatch-band",
+  "version": "0.1.0",
+  "description": "One line per Codex/Gemini job this Claude session dispatched, just above the prompt: activity graph, stage dots, stage, time, the command it is running now, files changed and tests passing. /dispatches on|off",
+  "license": "MIT",
+  "repository": "https://github.com/rhan1/crewline",
+  "types": "./types/index.d.ts"
+}
