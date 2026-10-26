@@ -1,0 +1,99 @@
+{
+  "source": "crewline seed (measured on one ChatGPT Plus + Google AI Pro + Claude Max setup, Oct 2026)",
+  "note": "Seed only: copied to ~/.claude/quota-cost-model.json on first run, then re-measured from YOUR history once a day (job sizes from the dispatch ledgers / Claude agent transcripts; window sizes from Codex rollouts and quota snapshots). Token counts are fresh-eq: codex = input - cached_input + output; agy = input + output + cache_weight.agy x cache_read; claude = input + cache_creation + output + cache_weight.claude x cache_read. window_100 = tokens that move a 5h window by 100 %; it differs by plan, so refit_unconfirmed_max lets the daily refit move it up to 10x without hand-measured pairs.",
+  "window_100": {
+    "codex_personal_5h": 1200000,
+    "codex_work_5h": 1100000,
+    "agy_5h": 33000000,
+    "agy_argon_wk": 3500000,
+    "claude_5h": 120000000
+  },
+  "cache_weight": {
+    "agy": 0.127,
+    "claude": 0.1
+  },
+  "classes": {
+    "codex:high": {
+      "S": 84982,
+      "M": 131149,
+      "L": 306998,
+      "XL": 613996
+    },
+    "codex:std": {
+      "S": 54611,
+      "M": 75187,
+      "L": 171585,
+      "XL": 343170
+    },
+    "codex:max": {
+      "S": 73369,
+      "M": 112371,
+      "L": 207147,
+      "XL": 414294
+    },
+    "codex:algo": {
+      "S": 159000,
+      "M": 204000,
+      "L": 343000,
+      "XL": 686000
+    },
+    "codex:lite": {
+      "S": 38000,
+      "M": 47000,
+      "L": 90000,
+      "XL": 180000
+    },
+    "agy:flash": {
+      "S": 347938,
+      "M": 850207,
+      "L": 2728814,
+      "XL": 5457628
+    },
+    "agy:argon": {
+      "S": 875000,
+      "M": 1750000,
+      "L": 1750000,
+      "XL": 3500000
+    },
+    "claude:haiku": {
+      "S": 41190,
+      "M": 59942,
+      "L": 118237,
+      "XL": 236473
+    },
+    "claude:sonnet": {
+      "S": 194484,
+      "M": 409450,
+      "L": 2210050,
+      "XL": 4420099
+    },
+    "claude:opus": {
+      "S": 540174,
+      "M": 857850,
+      "L": 2032957,
+      "XL": 4065914
+    },
+    "claude:fable": {
+      "S": 313968,
+      "M": 539650,
+      "L": 721449,
+      "XL": 1442898
+    }
+  },
+  "expected_secs": {
+    "codex": 1500,
+    "agy": 1200,
+    "claude": 900
+  },
+  "ceiling": {
+    "default": 85,
+    "last_hour": 100,
+    "last_hour_secs": 3600
+  },
+  "size_rule": {
+    "L_chars": 4000,
+    "L_deliverables": 3,
+    "XL_deliverables": 6
+  },
+  "refit_unconfirmed_max": 10
+}

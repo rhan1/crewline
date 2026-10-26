@@ -150,6 +150,10 @@ if [ -n "$TIER" ]; then
               -c "service_tier=\"$SERVICE_TIER\"")
 fi
 
+# Admission (usage forecast, scripts/quota-forecast.mjs): wait here while this job would not fit the Codex 5h
+# window once every session's running and waiting jobs are counted. Exit 4 = queued (DISPATCH_ADMIT_WAIT=0 only).
+dc_admit codex "${TIER:-high}" personal || exit $?
+
 TS_FILE="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_FILE="$LOG_DIR/codex-${TS_FILE}.log"
 LAST_JSON="$CLAUDE_DIR/codex-last.json"
@@ -160,6 +164,7 @@ LAST_JSON="$CLAUDE_DIR/codex-last.json"
 {
   echo "── codex-dispatch: $TASK_NAME @ $TS_FILE ──"
   echo "spec: $SPEC_FILE"
+  [ -n "${ADMIT_LINE:-}" ] && echo "[admission] $ADMIT_LINE"
   if [ -n "$TIER" ]; then
     echo "[CodexRoute] tier=$TIER model=$TIER_MODEL effort=$TIER_EFFORT service_tier=$SERVICE_TIER source=$ROUTE_SOURCE complexity=${ROUTE_CX}%"
   else
@@ -298,5 +303,17 @@ dc_write_last_json "$LAST_JSON" codex
   echo "log:     $LOG_FILE"
   echo "summary: $LAST_JSON"
 } | tee -a "$LOG_FILE"
+
+# Codex token ledger (usage forecast): one line per finished dispatch; quota-forecast.mjs re-measures job sizes
+# from it and reports estimate-vs-actual drift. CODEX_TOKEN_LEDGER_FILE = test seam.
+_l_pp=null; [[ "${CLAUDE_PID:-}" =~ ^[0-9]+$ ]] && _l_pp="$CLAUDE_PID"
+_l_tok="${TOKENS:-0}"; [[ "$_l_tok" =~ ^[0-9]+$ ]] || _l_tok=0
+_l_el="${ELAPSED:-0}"; [[ "$_l_el" =~ ^[0-9]+([.][0-9]+)?$ ]] || _l_el=0
+_l_est="${ADMIT_EST:-null}"; [[ "$_l_est" =~ ^[0-9]+([.][0-9]+)?$ ]] || _l_est=null
+_l_win="${ADMIT_WINDOW:-}"; [ "$_l_win" = "-" ] && _l_win=""
+mkdir -p "$CLAUDE_DIR/run-status" 2>/dev/null || true
+printf '{"timestamp":"%s","task_name":"%s","model":"%s","tier":"%s","login":"personal","tokens":%s,"elapsed_s":%s,"status":"%s","parent_pid":%s,"project":"%s","window":"%s","est_pct":%s,"size":"%s"}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TASK_NAME" "${TIER_MODEL:-}" "${TIER:-}" "$_l_tok" "$_l_el" "${STATUS:-}" "$_l_pp" \
+  "${ADMIT_PROJECT:-}" "$_l_win" "$_l_est" "${ADMIT_SIZE:-}" >> "${CODEX_TOKEN_LEDGER_FILE:-$CLAUDE_DIR/run-status/codex-token-ledger.jsonl}" 2>/dev/null || true
 
 exit "$EXIT_CODE"

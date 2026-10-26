@@ -17,7 +17,7 @@ export function tier(width: number): { task: number; label: number; doing: numbe
   return { task: 16, label: 12, doing: 0, meta: false }
 }
 
-/** D1 (the chosen look): smoothed bars on a baseline that never breaks, one scale shared by every row. */
+/** Smoothed bars on a baseline that never breaks, one scale shared by every row. */
 export function activityBars(h: number[] | undefined, n: number, max: number): string {
   const x = (h ?? []).slice(-n)
   const v = [...Array(Math.max(0, n - x.length)).fill(0), ...x] as number[]
@@ -36,4 +36,15 @@ export function stageDots(r: Pick<Dispatch, 'stage' | 'of'>, f: number, live: bo
     if (i < n) parts.push(i < cur ? '━' : '┄')
   }
   return parts.join('')
+}
+
+/** A job the usage forecast is holding: "waiting · codex full · starts ~21:40" (local time of fits_at). */
+export function waitText(r: Pick<Dispatch, 'fits_at' | 'window'>, nowSec: number): string {
+  const at = r.fits_at ?? 0
+  const when = at > nowSec ? `starts ~${hhmm(at)}` : 'starting soon'
+  return ['waiting', r.window ? `${r.window} full` : '', when].filter(Boolean).join(' · ')
+}
+export const hhmm = (sec: number) => {
+  const d = new Date(sec * 1000)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }

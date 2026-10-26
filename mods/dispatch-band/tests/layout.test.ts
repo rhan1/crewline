@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { activityBars, cut, mins, rowKey, stageDots, tier } from '../hooks/layout'
+import { activityBars, cut, hhmm, mins, rowKey, stageDots, tier, waitText } from '../hooks/layout'
 
 describe('stage dots', () => {
   test('done, current and to-do stages', () => {
@@ -43,5 +43,14 @@ describe('columns and helpers', () => {
     expect(cut('abcdef', 4)).toBe('abc…')
     expect(mins(30)).toBe('1m')
     expect(mins(3900)).toBe('1h05')
+  })
+})
+
+describe('waiting rows (usage forecast queue)', () => {
+  test('names the full window and the local start time', () => {
+    expect(waitText({ fits_at: 2000, window: 'codex' }, 1000)).toBe(`waiting · codex full · starts ~${hhmm(2000)}`)
+  })
+  test('a start time already passed reads "starting soon", never a past clock time', () => {
+    expect(waitText({ fits_at: 500, window: 'gemini' }, 1000)).toBe('waiting · gemini full · starting soon')
   })
 })

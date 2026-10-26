@@ -89,6 +89,7 @@ Once installed and the settings.json snippet is merged, these are available via 
 | `/execute-at-reset <plan>` | Schedule a plan to auto-execute ~1 min after the next 5h reset (via Claude Code's `CronCreate`) |
 | `/burn` | Burn-rate posture: is there surplus 5h budget that will expire unused, or should you conserve? Reports SPRINT / SPEND / NORMAL / CONSERVE / CRITICAL |
 | `/agents` | Live view of native Claude subagents (Agent/Task tool) — running vs done, each one's task, duration, and a completion count. Reads the subagent transcripts Claude Code maintains, so it works across sessions and even when rate-limited |
+| `/forecast` | Which 5h windows are spoken for by every session's running and waiting jobs, what is queued and when it starts. See **Usage forecast and admission** below |
 | `/balance` | Cross-provider budget health: scores Claude / Codex / Gemini together and says who should take the next job. See **Cross-provider balancing** below |
 | `/handoff <slug> <task>` | Hand a task to a dedicated executor session in its own named Warp tab, keeping the current session free to plan and review. See **Executor tabs** below |
 
@@ -132,9 +133,10 @@ Unconditional rules like "mechanical work goes to executor X" are what drain a s
 1. **Capability blockers → Claude.** Browser driving, DB/VPN/credential work, MCP tools, security review, anything interactive, and an explicit `model:` on a judgment task (review, verify, audit, plan, adversarial…) stay on Claude. A negated mention ("no browser needed") is not a blocker.
 2. **agy-eligibility.** The task must hit at least one fitness signal (exploration/file-reading, mechanical code, batch, long-context read) AND the prompt must be ≥ 200 chars. Otherwise it stays on Claude.
 3. **Capacity from `/balance`.** agy weekly or 5h in floor breach or `EXHAUSTED` → Claude. Claude 7d in `SPEND` with surplus ≥ agy weekly surplus + 20, and agy weekly not `SPEND`/`SPRINT`/`IDLE` → Claude (use-or-lose). Otherwise → `agy-worker`.
-4. **Enforcement.** With `ROUTE_ENFORCE=1` the call is rewritten to `subagent_type: "agy-worker"`. Unset, the hook only adds a one-line `[route] …` advisory.
-5. **Claude tier.** Whatever stays on Claude goes to RuFlo (`ruflo-model-enforcer.js`), which picks haiku/sonnet/opus.
-6. **Audit.** `agy-worker-audit.js` flags an `agy-worker` that did the work itself on Claude tokens instead of dispatching.
+4. **Forecast steer.** If the side picked in step 3 has its 5h window already spoken for (projected past its ceiling by `quota-forecast.mjs`, counting every session's running and waiting jobs) and the other side has room, the call goes to the other side (`agy 5h forecast 92%` / `Claude 5h forecast 90%` on the line). Both full → unchanged. `ROUTE_FORECAST_JSON` is the test seam.
+5. **Enforcement.** With `ROUTE_ENFORCE=1` the call is rewritten to `subagent_type: "agy-worker"`. Unset, the hook only adds a one-line `[route] …` advisory.
+6. **Claude tier.** Whatever stays on Claude goes to RuFlo (`ruflo-model-enforcer.js`), which picks haiku/sonnet/opus.
+7. **Audit.** `agy-worker-audit.js` flags an `agy-worker` that did the work itself on Claude tokens instead of dispatching.
 
 `agents/agy-worker.md` is a thin dispatcher subagent pinned to `model: haiku` with only the Bash tool. It writes the spec, runs `gemini-dispatch.sh` in the foreground, and **verifies the deliverable exists and parses before reporting success.** Antigravity has a documented failure mode where it returns a detailed, confident success narrative for a file it never wrote, so "it said it worked" is not evidence.
 
@@ -154,6 +156,15 @@ Unconditional rules like "mechanical work goes to executor X" are what drain a s
 **Stale and IDLE.** A cache older than 6h, or a window whose reset time has already passed, is dropped from the table and listed under `STALE` (`stale` in `--json`). Consumers treat a missing row as unknown, not as live data. agy and Codex windows are anchored on first use, so an untouched window reads as `IDLE`: surplus = left% − floor (≈ +85), and it never loses the use-or-lose tie-break. Codex shows two rows, `Codex` (5h) and `Codex weekly`.
 
 **Wrapper floor gate.** `codex-dispatch.sh` and `gemini-dispatch.sh` call `dc_quota_gate` before building a prompt or writing any status file. A fresh `/balance` reading of `EXHAUSTED` or floor breach for that provider refuses the dispatch with exit code `3`. Missing, stale or unparseable quota data fails **open** (the dispatch proceeds). `DISPATCH_FORCE=1` overrides.
+
+**Usage forecast and admission.** The floor gate only refuses once a window is nearly empty. With several Claude sessions dispatching at once, each one sees room and they all start, then everything stalls together at the limit. So both wrappers also call `dc_admit` (in `dispatch-common.sh`), which asks `scripts/quota-forecast.mjs`: *does this job fit its 5h window once every session's running and waiting jobs are counted?*
+
+- **Running jobs are measured live:** Codex from the job's rollout file (`~/.codex/sessions/…`, its token count and the live rate-limit reading), Gemini from the usage lines in its dispatch log, Claude subagents from their transcripts. A job's estimate comes from its size class (S/M/L/XL, from the spec: ≥ 6 deliverable headings or "run all night" → XL, ≥ 4k chars or ≥ 3 deliverables → L, else M; `DISPATCH_SIZE` overrides) and is re-measured daily from your own history.
+- **Verdict:** fits → runs as before. Doesn't fit → the wrapper prints `admission: QUEUED until HH:MM …` and **waits in place**, re-checking every 2 min (up to 6 h), then starts on its own. `DISPATCH_ADMIT_WAIT=0` exits `4` instead.
+- **Rule:** the caller picks the model (task complexity); the forecast only decides *when*. It never switches vendor or downgrades a model. First come, first served; while another project waits, no project takes more than its fair share; `DISPATCH_PRIORITY=pin` goes first; a running job is never stopped. Ceiling 85 % of a 5h window (the rest stays free for interactive work), 100 % in the window's last hour.
+- **Off switches:** `DISPATCH_ADMIT=off`; `DISPATCH_FORCE=1` also bypasses it. Missing or stale data fails **open**.
+- **Cost model:** `~/.claude/quota-cost-model.json`, created from `scripts/quota-cost-model.seed.json` on first run. The seed's window sizes were measured on one setup (ChatGPT Plus, Google AI Pro, Claude Max); once a day `/forecast` re-measures job sizes from the dispatch ledgers (`~/.claude/run-status/codex-token-ledger.jsonl`) and window sizes from Codex rollouts and `~/.claude/run-status/quota-snapshots.jsonl` (`--refit-budgets`, applied only when ≥ 8 windows agree).
+- **Tests:** `bash tests/test-forecast.sh` (sandboxed HOMEs, fixed clock).
 
 **Reserved Codex tiers.** `CODEX_TIER=max` / `algo` (GPT-6 Astra) are for architect-level planning/review and need `CODEX_ALLOW_RESERVED=1`; without it the wrapper exits `2`. `CODEX_SERVICE_TIER` accepts only `default` (`flex` is dead server-side, `priority` costs extra without buying quota).
 
@@ -278,6 +289,7 @@ dispatches 3 running in this session · 2 codex · 1 gemini
 - **Now**: the command / file the job is touching this second, plus files changed and tests passing.
 - A job with no new output for 3 min stops moving and turns amber (`quiet 4m`).
 - Only this session's jobs: each record carries the launching session's `CLAUDE_PID`.
+- Jobs the usage forecast is holding show as amber `waiting · codex full · starts ~21:53` rows, and the header counts them.
 
 Install (Claude Code with mods support):
 

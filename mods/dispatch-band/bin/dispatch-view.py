@@ -6,7 +6,9 @@ dispatch-common.sh writes to ~/.claude/run-status/dispatch-running/*.json; a mar
 pid is gone is skipped. Per row: executor, task, model, profile, elapsed seconds, seconds
 since the log last grew, the launching session's name, and a one-line description of the
 task from its spec (first "# " heading, else the first plain sentence).
-Usage: dispatch-view.py [--dir DIR] [--now EPOCH]
+Waiting jobs (2026-10-25): entries the usage forecast parked in ~/.claude/run-status/dispatch-queue
+(state "waiting", owner pid alive) come back as rows with "waiting": true and "fits_at" (epoch it should start).
+Usage: dispatch-view.py [--dir DIR] [--queue-dir DIR] [--now EPOCH]
 """
 import argparse, glob, json, os, re, time
 
@@ -92,6 +94,7 @@ def alive(pid):
 def main():
     a = argparse.ArgumentParser()
     a.add_argument("--dir", default=f"{H}/.claude/run-status/dispatch-running")
+    a.add_argument("--queue-dir", default=f"{H}/.claude/run-status/dispatch-queue")
     a.add_argument("--now", type=float, default=None)
     a.add_argument("--session-pid", type=int, default=None, help="only dispatches launched by this Claude process")
     o = a.parse_args()
@@ -124,7 +127,34 @@ def main():
             **(log_detail(log) if log else {}),
         })
     rows.sort(key=lambda r: -r["elapsed"])
+    rows += waiting(o, now)
     print(json.dumps(rows))
+
+
+WINDOW = {"codex_personal_5h": "codex", "codex_work_5h": "codex work", "agy_5h": "gemini", "agy_argon_weekly": "argon"}
+
+
+def waiting(o, now):
+    """Jobs the forecast is holding until their window has room (oldest first)."""
+    out = []
+    qdir = os.environ.get("DISPATCH_BAND_QUEUE_DIR") or o.queue_dir
+    for f in glob.glob(os.path.join(qdir, "*.json")):
+        try:
+            q = json.load(open(f))
+        except Exception:
+            continue
+        if q.get("state", "waiting") != "waiting" or not q.get("pid") or not alive(q["pid"]):
+            continue
+        if o.session_pid and q.get("parent_pid") != o.session_pid and not os.environ.get("DISPATCH_BAND_QUEUE_DIR"):
+            continue
+        out.append({
+            "executor": "codex" if q.get("provider") == "codex" else "agy",
+            "parent_pid": q.get("parent_pid"), "task": q.get("task") or "?", "model": "", "profile": "",
+            "elapsed": int(now - float(q.get("created") or now)), "quiet": None, "log_bytes": 0, "session": "", "what": "",
+            "waiting": True, "fits_at": q.get("fits_at"), "window": WINDOW.get(q.get("window"), q.get("window") or ""),
+        })
+    out.sort(key=lambda r: -r["elapsed"])
+    return out
 
 
 if __name__ == "__main__":

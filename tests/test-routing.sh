@@ -94,6 +94,18 @@ out="$(ROUTE_ENFORCE=1 ROUTE_CAPACITY_JSON="$FX/cap-agy-idle.json" resolver "$FX
 check "5b same Claude SPEND but agy weekly IDLE — rewritten to agy-worker" \
   test "$(printf '%s' "$out" | rewritten_to)" = "agy-worker"
 
+# ── 5c/5d. Usage-forecast steer (scripts/quota-forecast.mjs projection, fixture via ROUTE_FORECAST_JSON) ──
+printf '{"windows":{"agy_5h":{"projected":92,"ceiling":85,"stale":false},"claude_5h":{"projected":30,"ceiling":85,"stale":false}}}' > "$SANDBOX/fc-agy-full.json"
+out="$(ROUTE_ENFORCE=1 ROUTE_CAPACITY_JSON="$FX/cap-agy-spend.json" ROUTE_FORECAST_JSON="$SANDBOX/fc-agy-full.json" resolver "$FX/agent-explore.json")"
+c="$(printf '%s' "$out" | ctx)"
+if [ "$(printf '%s' "$out" | rewritten_to)" = "none" ] && [[ "$c" == *"agy 5h forecast 92%"* ]]; then
+  pass "5c agy 5h projected 92% (other sessions' jobs) — stays on Claude"
+else fail "5c agy 5h forecast full stays on Claude" "$c"; fi
+printf '{"windows":{"agy_5h":{"projected":20,"ceiling":85,"stale":false},"claude_5h":{"projected":30,"ceiling":85,"stale":false}}}' > "$SANDBOX/fc-agy-room.json"
+out="$(ROUTE_ENFORCE=1 ROUTE_CAPACITY_JSON="$FX/cap-agy-spend.json" ROUTE_FORECAST_JSON="$SANDBOX/fc-agy-room.json" resolver "$FX/agent-explore.json")"
+check "5d control: agy 5h projected 20% — rewritten to agy-worker" \
+  test "$(printf '%s' "$out" | rewritten_to)" = "agy-worker"
+
 # ── 6. Advisory without enforce ───────────────────────────────────────────────
 out="$(ROUTE_CAPACITY_JSON="$FX/cap-agy-spend.json" resolver "$FX/agent-explore.json")"
 c="$(printf '%s' "$out" | ctx)"
