@@ -2,11 +2,12 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Dispatch } from '../types'
-import { activityBars, cut, mins, rowKey, stageDots, tier } from './layout'
+import { activityBars, cut, mins, rowKey, stageDots, tier, waitText } from './layout'
 
 // Dispatch band (2026-10-25): one line per Codex / Gemini job THIS session dispatched —
 // activity graph (D1 smoothed bars), stage dots, stage, time, what it is doing now, files/tests.
 // Data: bin/dispatch-view.py (bundled) --session-pid <this claude pid>. /dispatches on|off.
+// Jobs the usage forecast is holding (quota-forecast.mjs queue) show as faint 'waiting · … · starts ~HH:MM' rows.
 // Claude's own subagents stay out: Claude Code draws them below the prompt and no mod can hide that list.
 
 const PYTHONS = ['/opt/homebrew/bin/python3', '/usr/bin/python3']
@@ -23,7 +24,7 @@ const QUIET_SECS = 180
 const GRAPH = 16
 const MAX_ROWS = 8
 
-const isActive = (r: Dispatch) => r.quiet === null || r.quiet < QUIET_SECS
+const isActive = (r: Dispatch) => !r.waiting && (r.quiet === null || r.quiet < QUIET_SECS)
 const vendor = (r: Dispatch) => (r.executor === 'codex' ? CODEX : GEMINI)
 
 export const register: Register = on => {
@@ -116,18 +117,33 @@ export const register: Register = on => {
     const dotsW = Math.max(0, ...shown.map(r => stageDots(r, 0, false).length))
     const labelOf = (r: Dispatch) => (r.stage && r.of ? `${r.stage}/${r.of} ${r.stage_name ?? ''}` : isActive(r) ? 'working' : '')
     const labelW = Math.min(t.label, Math.max(0, ...shown.map(r => labelOf(r).length)))
-    const nCodex = list.filter(r => r.executor === 'codex').length
+    const running = list.filter(r => !r.waiting)
+    const nWait = list.length - running.length
+    const nCodex = running.filter(r => r.executor === 'codex').length
+    const nowSec = Date.now() / 1000
 
     return (
       <Box flexDirection="column" marginTop={1} key="band">
         <Box key="hdr">
           <Text bold>dispatches </Text>
-          <Text color={FAINT}>{list.length} running in this session · </Text>
+          <Text color={FAINT}>{running.length} running in this session · </Text>
           <Text color={CODEX}>{nCodex} codex</Text>
           <Text color={FAINT}> · </Text>
-          <Text color={GEMINI}>{list.length - nCodex} gemini</Text>
+          <Text color={GEMINI}>{running.length - nCodex} gemini</Text>
+          {nWait > 0 && <Text color={AMBER}> · {nWait} waiting</Text>}
         </Box>
         {shown.map(r => {
+          if (r.waiting) {
+            return (
+              <Box key={`wait-${rowKey(r)}`}>
+                <Text color={vendor(r)}>{r.executor === 'codex' ? '◆' : '◇'} </Text>
+                <Text bold wrap="truncate-end">{cut(r.task, t.task).padEnd(t.task)} </Text>
+                <Text color={FAINT}>{'┄'.repeat(GRAPH)} </Text>
+                <Text color={AMBER} wrap="truncate-end">{waitText(r, nowSec)}</Text>
+                <Text color={FAINT}>  queued {mins(r.elapsed)}</Text>
+              </Box>
+            )
+          }
           const live = isActive(r)
           const meta = [r.files ? `${r.files} files` : '', r.tests ?? ''].filter(Boolean).join(' · ')
           return (

@@ -5,6 +5,7 @@ export type Dispatch = {
   session: string; what: string
   stage?: number | null; of?: number | null; stage_name?: string
   doing?: string; files?: number; tests?: string; steps?: number
+  waiting?: boolean; fits_at?: number | null; window?: string
 }
 
 declare module 'claude-code' {

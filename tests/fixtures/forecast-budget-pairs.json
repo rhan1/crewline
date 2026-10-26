@@ -1,0 +1,9 @@
+{"note": "Before/after window readings with the fresh/cache tokens burned between them (design 2026-10-25 §2.2, Appendix A). Gate: quota-forecast.mjs --check-budget <this>; RED control: --weight 0.",
+ "cases": [
+  {"name": "agy bench 10-16 (8 Flash jobs)", "window": "agy_5h", "provider": "agy", "fresh": 2560000, "cache": 26000000, "before": 0, "after": 17.6, "tol": 3},
+  {"name": "agy night 10-24 (7 jobs to RESOURCE_EXHAUSTED)", "window": "agy_5h", "provider": "agy", "fresh": 6360000, "cache": 212200000, "before": 0, "after": 100, "tol": 3},
+  {"name": "agy out-of-sample 10-24 23:11-23:26Z", "window": "agy_5h", "provider": "agy", "fresh": 384000, "cache": 3590000, "before": 0, "after": 2.6, "tol": 3},
+  {"name": "codex personal 10-24 18:08-18:30Z (3 jobs)", "window": "codex_personal_5h", "provider": "codex", "fresh": 987064, "cache": 0, "before": 0, "after": 81, "tol": 8},
+  {"name": "codex personal 10-24 23:11-23:33Z (4 jobs)", "window": "codex_personal_5h", "provider": "codex", "fresh": 848581, "cache": 0, "before": 0, "after": 65, "tol": 8},
+  {"name": "codex work 10-24 18:26-18:51Z", "window": "codex_work_5h", "provider": "codex", "fresh": 706000, "cache": 0, "before": 0, "after": 60, "tol": 8}
+ ]}

@@ -385,9 +385,14 @@ dc_running_mark() {
   [ -n "$spec" ] && [ "${spec#/}" = "$spec" ] && spec="$PWD/$spec"
   spec="$(printf '%s' "$spec" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   profile="$(printf '%s' "${CODEX_HOME:-}" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  # usage forecast: the admitted window, estimate, size and project (read by quota-forecast.mjs)
+  local fc=""
+  if [ -n "${ADMIT_WINDOW:-}" ] && [ "${ADMIT_WINDOW}" != "-" ]; then
+    fc=",\"window\":\"${ADMIT_WINDOW}\",\"est_pct\":${ADMIT_EST:-null},\"size\":\"${ADMIT_SIZE:-}\",\"project\":\"${ADMIT_PROJECT:-}\""
+  fi
   tmp="$dir/.${executor}-${task}.tmp.$$"
-  printf '{"executor":"%s","task":"%s","model":"%s","tier":"%s","started":%s,"pid":%s,"log":"%s","parent_pid":%s,"spec":"%s","profile":"%s"}\n' \
-    "$executor" "$task" "$model" "$tier" "$(dc_now)" "$$" "${LOG_FILE:-}" "$parent" "$spec" "$profile" > "$tmp" 2>/dev/null \
+  printf '{"executor":"%s","task":"%s","model":"%s","tier":"%s","started":%s,"pid":%s,"log":"%s","parent_pid":%s,"spec":"%s","profile":"%s"%s}\n' \
+    "$executor" "$task" "$model" "$tier" "$(dc_now)" "$$" "${LOG_FILE:-}" "$parent" "$spec" "$profile" "$fc" > "$tmp" 2>/dev/null \
     && mv -f "$tmp" "$dir/${executor}-${task}.json" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
 }
@@ -397,4 +402,61 @@ dc_running_clear() {
   # only our own record: a later dispatch with the same task name may own the file now
   [ -f "$f" ] && grep -q "\"pid\":$$," "$f" 2>/dev/null && rm -f "$f"
   return 0
+}
+
+# Admission (usage forecast). Asks quota-forecast.mjs whether this lane fits its 5h window once every session's
+# running and waiting jobs are counted. The model/tier is the caller's pick (task complexity); admission only decides
+# WHEN a job starts. First come, first served; a fair share per project while another project waits;
+# DISPATCH_PRIORITY=pin goes first; a running job is never stopped.
+# Usage: dc_admit <codex|agy> <tier> [any|personal|work]. Sets ADMIT_VERDICT ADMIT_WINDOW ADMIT_EST ADMIT_SIZE
+# ADMIT_PROJECT ADMIT_LINE. Returns 0 = run, 4 = queued.
+# By default a queued lane WAITS here (re-checks every DISPATCH_ADMIT_POLL=120 s, up to DISPATCH_ADMIT_MAX_WAIT=21600 s)
+# so a caller's loop needs no change; DISPATCH_ADMIT_WAIT=0 returns 4 at once. DISPATCH_SIZE=S|M|L|XL declares the
+# job's size (default: from the spec). Off switches: DISPATCH_ADMIT=off; DISPATCH_FORCE=1 or the DISPATCH_GATE_JSON
+# fixture seam also skip it unless DISPATCH_ADMIT=on. Fails OPEN when the forecast cannot be computed.
+dc_admit() {
+  local provider="${1:-}" tier="${2:-}" login="${3:-any}" line waited=0 said=0
+  ADMIT_VERDICT=""; ADMIT_WINDOW=""; ADMIT_EST=""; ADMIT_SIZE=""; ADMIT_PROJECT=""; ADMIT_LINE=""
+  if [ "${DISPATCH_ADMIT:-}" = "off" ]; then echo "admission: off (DISPATCH_ADMIT=off)" >&2; return 0; fi
+  if [ "${DISPATCH_ADMIT:-}" != "on" ]; then
+    if [ "${DISPATCH_FORCE:-}" = "1" ]; then echo "admission: bypassed by DISPATCH_FORCE=1" >&2; return 0; fi
+    [ -n "${DISPATCH_GATE_JSON:-}" ] && return 0
+  fi
+  command -v node >/dev/null 2>&1 || { echo "admission: unavailable — failing OPEN" >&2; return 0; }
+  local every="${DISPATCH_ADMIT_POLL:-120}" max_wait="${DISPATCH_ADMIT_MAX_WAIT:-21600}" wait_flag="" prio=""
+  [ "${DISPATCH_ADMIT_WAIT:-1}" = "1" ] && wait_flag="--wait"
+  [ "${DISPATCH_PRIORITY:-}" = "pin" ] && prio="pin"
+  while :; do
+    line="$(dc_timeout 30 node "$HOME/.claude/scripts/quota-forecast.mjs" --admit --provider "$provider" --tier "$tier" \
+      --login "$login" --task "${TASK_NAME:-adhoc}" --spec "${SPEC_FILE:-}" --size "${DISPATCH_SIZE:-}" \
+      --admit-size "${DISPATCH_ADMIT_SIZE:-}" --parent-pid "${CLAUDE_PID:-}" --ceiling "${DISPATCH_ADMIT_CEILING:-}" \
+      --priority "$prio" --pid "$$" $wait_flag ${DISPATCH_ADMIT_MANAGED:+--managed} 2>/dev/null | tail -1)"
+    # fields: VERDICT WINDOW EST PROJ CEILING FITS_AT PROJECT SIZE | reason  (read, not `set --`: no globbing)
+    local v_verdict="" v_win="" v_est="" v_proj="" v_ceil="" v_fits="" v_proj_name="" v_size="" v_rest=""
+    read -r v_verdict v_win v_est v_proj v_ceil v_fits v_proj_name v_size v_rest <<< "$line"
+    set -- "$v_verdict" "$v_win" "$v_est" "$v_proj" "$v_ceil" "$v_fits" "$v_proj_name" "$v_size"
+    case "${1:-}" in
+      ADMIT|REROUTE)
+        ADMIT_VERDICT="$1"; ADMIT_WINDOW="$2"; ADMIT_EST="$3"; ADMIT_PROJECT="$7"; ADMIT_SIZE="$8"; ADMIT_LINE="$line"
+        case "$line" in
+          *FAILOPEN*) echo "admission: unavailable — failing OPEN (${line#*| })" >&2 ;;
+          *) if [ "$waited" -gt 0 ]; then echo "admission: admitted after waiting $((waited / 60)) min — ${line#*| }" >&2
+             elif [ "$1" = "REROUTE" ]; then echo "admission: rerouted to $2 — ${line#*| }" >&2; fi ;;
+        esac
+        return 0 ;;
+      QUEUE)
+        ADMIT_VERDICT="QUEUE"; ADMIT_WINDOW="$2"; ADMIT_LINE="$line"
+        local until_hm; until_hm="$(date -r "${6:-0}" '+%H:%M' 2>/dev/null || echo '?')"
+        if [ -z "$wait_flag" ] || [ "$waited" -ge "$max_wait" ]; then
+          echo "admission: QUEUED until ${until_hm} (window $2 projected $4%, ceiling $5%, est $3%) — ${line#*| }. Not started; re-run then, or set DISPATCH_ADMIT=off to override." >&2
+          return 4
+        fi
+        if [ "$said" -eq 0 ]; then
+          echo "admission: QUEUED until ${until_hm} (window $2 projected $4%, ceiling $5%, est $3%) — ${line#*| }; waiting here, re-checking every $((every / 60)) min" >&2
+          said=1
+        fi
+        sleep "$every"; waited=$((waited + every)) ;;
+      *) echo "admission: unavailable — failing OPEN" >&2; return 0 ;;
+    esac
+  done
 }

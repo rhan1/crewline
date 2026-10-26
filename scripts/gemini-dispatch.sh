@@ -47,6 +47,11 @@ fi
 # never shows a run that did not happen. Exit 3 = refused. DISPATCH_FORCE=1 overrides.
 dc_quota_gate '^agy (5h|weekly)$' "$HOME/.claude/agy-quota.json" || exit $?
 
+# Admission (usage forecast, scripts/quota-forecast.mjs): wait here while this job would not fit the agy 5h window
+# once every session's running and waiting jobs are counted. Exit 4 = queued (DISPATCH_ADMIT_WAIT=0 only).
+case "${AGY_MODEL:-}" in *argon*|*Argon*) _agy_cls=argon ;; *) _agy_cls=flash ;; esac
+dc_admit agy "$_agy_cls" || exit $?
+
 CLAUDE_DIR="$HOME/.claude"
 LOG_DIR="$CLAUDE_DIR/logs"
 mkdir -p "$LOG_DIR"
@@ -102,6 +107,7 @@ esac
   echo "── gemini-dispatch: $TASK_NAME @ $TS_FILE ──"
   echo "spec:        $SPEC_FILE"
   echo "attachments: $ATTACHMENT_COUNT"
+  [ -n "${ADMIT_LINE:-}" ] && echo "[admission] $ADMIT_LINE"
   echo ""
 } | tee -a "$LOG_FILE"
 

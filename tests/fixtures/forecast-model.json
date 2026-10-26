@@ -1,0 +1,25 @@
+{
+  "source": "design-20261025",
+  "note": "Seeded from ~/.claude/plans/usage-forecast-20261025/design.md §2.2-2.3 (measured 10-10..10-25). Token counts are fresh-eq: codex = input - cached_input + output; agy = input + output + cache_weight.agy x cache_read. classes are refreshed from the ledgers by `quota-forecast.mjs --refresh-classes` (daily, from /forecast); window_100 stays as measured until snapshot fitting exists.",
+  "window_100": {
+    "codex_personal_5h": 1200000,
+    "codex_work_5h": 1100000,
+    "agy_5h": 33000000,
+    "agy_argon_wk": 3500000,
+    "claude_5h": 120000000
+  },
+  "cache_weight": { "agy": 0.127, "claude": 0.1 },
+  "classes": {
+    "codex:high": { "S": 113000, "M": 148000, "L": 333000, "XL": 666000 },
+    "codex:std":  { "S": 75000,  "M": 93000,  "L": 180000, "XL": 360000 },
+    "codex:max":  { "S": 159000, "M": 204000, "L": 343000, "XL": 686000 },
+    "codex:algo": { "S": 159000, "M": 204000, "L": 343000, "XL": 686000 },
+    "codex:lite": { "S": 38000,  "M": 47000,  "L": 90000,  "XL": 180000 },
+    "agy:flash":  { "S": 490000, "M": 950000, "L": 2750000, "XL": 5500000 },
+    "agy:argon":  { "S": 875000, "M": 1750000, "L": 1750000, "XL": 3500000 }
+  },
+  "classes_updated": null,
+  "expected_secs": { "codex": 1500, "agy": 1200 },
+  "ceiling": { "default": 85, "last_hour": 100, "last_hour_secs": 3600 },
+  "size_rule": { "L_chars": 4000, "L_deliverables": 3, "XL_deliverables": 6 }
+}

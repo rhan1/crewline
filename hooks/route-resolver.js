@@ -114,6 +114,23 @@ function loadCapacity() {
   }
 }
 
+// Usage forecast (scripts/quota-forecast.mjs): projected 5h load of agy and Claude counting
+// every session's running/waiting jobs and running Claude agents (quota-forecast.mjs). Used only to steer an eligible
+// lane away from a window that is already spoken for; it never blocks a call. ROUTE_FORECAST_JSON = fixture seam.
+function loadForecast() {
+  try {
+    const H = process.env.HOME || require('os').homedir();
+    const raw = process.env.ROUTE_FORECAST_JSON ? fs.readFileSync(process.env.ROUTE_FORECAST_JSON, 'utf8')
+      : execSync(`node '${path.join(H, '.claude', 'scripts', 'quota-forecast.mjs')}' --json`, { timeout: 3000, encoding: 'utf8' });
+    const f = JSON.parse(raw);
+    let model = { classes: {}, window_100: {} };
+    try { model = JSON.parse(fs.readFileSync(path.join(H, '.claude', 'quota-cost-model.json'), 'utf8')); } catch {}
+    const pct = (cls, w) => (model.classes && model.classes[cls] && model.window_100 && model.window_100[w] ? (model.classes[cls].M / model.window_100[w]) * 100 : 1);
+    return { agy5h: f.windows && f.windows.agy_5h, claude5h: f.windows && f.windows.claude_5h, pct };
+  } catch { return null; }
+}
+const roomFor = (w, est) => !!w && !w.stale && Number.isFinite(w.projected) && w.projected + est <= w.ceiling;
+
 function logDecision(entry) {
   // Logging is diagnostic only — never let it affect the hook's exit path.
   try {
@@ -203,6 +220,22 @@ try {
     }
   }
 
+  // ── Forecast steer: only between agy and Claude, only for eligible lanes, only when the chosen side's 5h window
+  // is projected past its ceiling and the other side has room.
+  let fc = null;
+  if (!isWorkflow && eligible && (decision === 'agy' || reason === '7d use-or-lose')) {
+    fc = loadForecast();
+    if (fc) {
+      const fam = (String(input.model || 'sonnet').match(/haiku|sonnet|opus|fable|mythos/) || ['sonnet'])[0];
+      const estAgy = fc.pct('agy:flash', 'agy_5h'), estClaude = fc.pct(`claude:${fam}`, 'claude_5h');
+      if (decision === 'agy' && fc.agy5h && !fc.agy5h.stale && !roomFor(fc.agy5h, estAgy) && roomFor(fc.claude5h, estClaude)) {
+        decision = 'claude'; reason = `agy 5h forecast ${Math.round(fc.agy5h.projected)}%`;
+      } else if (decision === 'claude' && fc.claude5h && !fc.claude5h.stale && !roomFor(fc.claude5h, estClaude) && roomFor(fc.agy5h, estAgy)) {
+        decision = 'agy'; reason = `Claude 5h forecast ${Math.round(fc.claude5h.projected)}%`;
+      }
+    }
+  }
+
   // ── Enforcement (Agent only — Workflow's tool_input can't be rewritten) ────
   const rewritable = !subagentType || REWRITABLE.has(subagentType);
   let updatedInput = null;
@@ -238,6 +271,7 @@ try {
       agy5h: capacity.agy5h ? { surplus: capacity.agy5h.surplus, state: capacity.agy5h.state, floorBreach: capacity.agy5h.floorBreach } : null,
       codex: capacity.codex ? { surplus: capacity.codex.surplus, state: capacity.codex.state } : null,
     } : null,
+    forecast: fc ? { agy5h: fc.agy5h ? fc.agy5h.projected : null, claude5h: fc.claude5h ? fc.claude5h.projected : null } : null,
     decision,
     reason,
     enforced: !!updatedInput,
