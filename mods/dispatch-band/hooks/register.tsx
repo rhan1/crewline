@@ -19,13 +19,18 @@ const isOn = atom({ plugin: 'dispatch-band', key: 'isOn' } as const, true)
 const CODEX = '#10a37f'
 const GEMINI = '#a78bfa'
 const AMBER = '#f5a623'
+const CLAUDE = '#ffa94d'   // Opus orange, the statusline's model-name colour
+const BUILD = '#22d3ee'   // holds the build slot
+const QUEUED = AMBER      // queued for the build slot, like a usage-window wait
 const FAINT = '#6b7280'
 const QUIET_SECS = 180
 const GRAPH = 16
 const MAX_ROWS = 8
 
-const isActive = (r: Dispatch) => !r.waiting && (r.quiet === null || r.quiet < QUIET_SECS)
-const vendor = (r: Dispatch) => (r.executor === 'codex' ? CODEX : GEMINI)
+const isActive = (r: Dispatch) => !r.waiting && !r.queued && (r.building || r.quiet === null || r.quiet < QUIET_SECS)
+const vendor = (r: Dispatch) => (r.executor === 'codex' ? CODEX : r.executor === 'claude' ? CLAUDE : GEMINI)
+const buildTint = (r: Dispatch) => (r.executor === 'claude' ? CLAUDE : BUILD)   // Claude rows stay orange while building
+const glyph = (r: Dispatch) => (r.executor === 'codex' ? '◆' : r.executor === 'claude' ? '✻' : '◇')
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -115,11 +120,14 @@ export const register: Register = on => {
     const shown = list.slice(0, Math.max(1, Math.min(MAX_ROWS, (e.props.maxRows ?? 12) - 3)))
     const gmax = Math.max(1, ...shown.flatMap(r => (hist[rowKey(r)] ?? []).slice(-GRAPH)))
     const dotsW = Math.max(0, ...shown.map(r => stageDots(r, 0, false).length))
-    const labelOf = (r: Dispatch) => (r.stage && r.of ? `${r.stage}/${r.of} ${r.stage_name ?? ''}` : isActive(r) ? 'working' : '')
+    const labelOf = (r: Dispatch) => (r.stage && r.of ? `${r.stage}/${r.of} ${r.stage_name ?? ''}` : r.building ? 'building' : isActive(r) ? 'working' : '')
     const labelW = Math.min(t.label, Math.max(0, ...shown.map(r => labelOf(r).length)))
     const running = list.filter(r => !r.waiting)
     const nWait = list.length - running.length
     const nCodex = running.filter(r => r.executor === 'codex').length
+    const nClaude = running.filter(r => r.executor === 'claude').length
+    const nBuild = running.filter(r => r.building).length
+    const nQueued = running.filter(r => r.queued).length
     const nowSec = Date.now() / 1000
 
     return (
@@ -129,14 +137,18 @@ export const register: Register = on => {
           <Text color={FAINT}>{running.length} running in this session · </Text>
           <Text color={CODEX}>{nCodex} codex</Text>
           <Text color={FAINT}> · </Text>
-          <Text color={GEMINI}>{running.length - nCodex} gemini</Text>
+          <Text color={GEMINI}>{running.length - nCodex - nClaude} gemini</Text>
+          {nClaude > 0 && <Text color={FAINT}> · </Text>}
+          {nClaude > 0 && <Text color={CLAUDE}>{nClaude} claude</Text>}
+          {nBuild > 0 && <Text color={BUILD}> · {nBuild} building</Text>}
+          {nQueued > 0 && <Text color={QUEUED}> · {nQueued} queued for the build slot</Text>}
           {nWait > 0 && <Text color={AMBER}> · {nWait} waiting</Text>}
         </Box>
         {shown.map(r => {
           if (r.waiting) {
             return (
               <Box key={`wait-${rowKey(r)}`}>
-                <Text color={vendor(r)}>{r.executor === 'codex' ? '◆' : '◇'} </Text>
+                <Text color={vendor(r)}>{glyph(r)} </Text>
                 <Text bold wrap="truncate-end">{cut(r.task, t.task).padEnd(t.task)} </Text>
                 <Text color={FAINT}>{'┄'.repeat(GRAPH)} </Text>
                 <Text color={AMBER} wrap="truncate-end">{waitText(r, nowSec)}</Text>
@@ -144,18 +156,32 @@ export const register: Register = on => {
               </Box>
             )
           }
+          if (r.queued) {
+            return (
+              <Box key={`queued-${rowKey(r)}`}>
+                <Text color={vendor(r)}>{glyph(r)} </Text>
+                <Text bold wrap="truncate-end">{cut(r.task, t.task).padEnd(t.task)} </Text>
+                <Text color={QUEUED}>{'┄'.repeat(GRAPH)} </Text>
+                <Text color={QUEUED}>queued {mins(r.queued_secs ?? 0)}</Text>
+                {t.doing > 0 && <Text color={QUEUED} wrap="truncate-end"> · {cut(r.doing || '', t.doing)}</Text>}
+              </Box>
+            )
+          }
           const live = isActive(r)
+          const tint = r.building ? buildTint(r) : live ? vendor(r) : AMBER
           const meta = [r.files ? `${r.files} files` : '', r.tests ?? ''].filter(Boolean).join(' · ')
           return (
             <Box key={rowKey(r)}>
-              <Text color={vendor(r)}>{r.executor === 'codex' ? '◆' : '◇'} </Text>
+              <Text color={vendor(r)}>{glyph(r)} </Text>
               <Text bold wrap="truncate-end">{cut(r.task, t.task).padEnd(t.task)} </Text>
-              <Text color={live ? vendor(r) : AMBER}>{activityBars(hist[rowKey(r)], GRAPH, gmax)} </Text>
-              {dotsW > 0 && <Text color={live ? vendor(r) : AMBER}>{stageDots(r, f, live).padEnd(dotsW)} </Text>}
+              <Text color={tint}>{activityBars(hist[rowKey(r)], GRAPH, gmax)} </Text>
+              {dotsW > 0 && <Text color={tint}>{stageDots(r, f, live).padEnd(dotsW)} </Text>}
               {labelW > 0 && <Text color={FAINT} wrap="truncate-end">{cut(labelOf(r), labelW).padEnd(labelW)} </Text>}
               <Text>{mins(r.elapsed).padStart(4)} </Text>
               {!live && <Text color={AMBER}>quiet {mins(r.quiet ?? 0)} </Text>}
-              {t.doing > 0 && <Text dimColor wrap="truncate-end">{cut(r.doing || r.what, t.doing)}</Text>}
+              {t.doing > 0 && (r.building
+                ? <Text color={buildTint(r)} wrap="truncate-end">{cut(r.doing || r.what, t.doing)}</Text>
+                : <Text dimColor wrap="truncate-end">{cut(r.doing || r.what, t.doing)}</Text>)}
               {t.meta && meta && <Text color={FAINT} wrap="truncate-end">  {meta}</Text>}
             </Box>
           )

@@ -8,11 +8,73 @@ since the log last grew, the launching session's name, and a one-line descriptio
 task from its spec (first "# " heading, else the first plain sentence).
 Waiting jobs (2026-10-25): entries the usage forecast parked in ~/.claude/run-status/dispatch-queue
 (state "waiting", owner pid alive) come back as rows with "waiting": true and "fits_at" (epoch it should start).
+"quiet" (2026-10-27): seconds since the job last did
+anything, i.e. its log grew OR its process tree (the marker pid and every descendant) burned >= 5% of a
+core over a >= 30 s sample, or started a new child process since the last sample (sleep/grep/cat-style wait-loop commands excluded). A manager waiting on its own long build is busy, not quiet. CPU baselines
+persist in ~/.claude/run-status/dispatch-band-activity.json between polls.
 Usage: dispatch-view.py [--dir DIR] [--queue-dir DIR] [--now EPOCH]
 """
-import argparse, glob, json, os, re, time
+import argparse, glob, json, os, re, shlex, subprocess, time
 
 H = os.path.expanduser("~")
+ACTIVITY = os.environ.get("DISPATCH_BAND_ACTIVITY") or f"{H}/.claude/run-status/dispatch-band-activity.json"
+CPU_SAMPLE_SECS, CPU_BUSY_SHARE = 30, 0.05
+IDLE_PIDS = set()
+WAIT_CMDS = {"sleep", "grep", "cat", "test", "[", "date", "ps", "pgrep", "kill", "stat", "tail", "head", "wc", "awk", "sed", "ls", "find", "tr", "cut", "jq"}
+
+
+def cpu_secs(t):
+    # ps time: "MM:SS.ss" (minutes may exceed 59) or "H:MM:SS" / "D-HH:MM:SS"
+    days = 0
+    if "-" in t: d, t = t.split("-", 1); days = int(d)
+    parts = [float(p) for p in t.split(":")]
+    s = 0.0
+    for p in parts: s = s * 60 + p
+    return days * 86400 + s
+
+
+def process_table():
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,time=,comm="], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return {}, {}
+    kids, cpu = {}, {}
+    for line in out.splitlines():
+        f = line.split(None, 3)
+        if len(f) != 4: continue
+        try: pid, ppid, c = int(f[0]), int(f[1]), cpu_secs(f[2])
+        except ValueError: continue
+        kids.setdefault(ppid, []).append(pid); cpu[pid] = c
+        if os.path.basename(f[3]) in WAIT_CMDS: IDLE_PIDS.add(pid)   # wait/poll loops spawn these; not work
+    return kids, cpu
+
+
+def tree_cpu(pid, kids, cpu):
+    """{pid: cpu seconds} for pid and every descendant alive now."""
+    out, stack = {}, [pid]
+    while stack:
+        p = stack.pop()
+        if p in out: continue
+        out[p] = cpu.get(p, 0.0); stack += kids.get(p, [])
+    return out
+
+
+def last_busy(key, pid, now, kids, cpu, state):
+    """Epoch the job's process tree was last seen busy, or None. Updates state[key] in place.
+    CPU is compared per process (children come and go: a build spawns and reaps compilers), a process
+    born since the last sample counts in full."""
+    if not pid or not cpu: return None
+    cur = tree_cpu(int(pid), kids, cpu)
+    s = state.get(key)
+    if not s or s.get("pid") != pid or not isinstance(s.get("c0"), dict):
+        state[key] = {"pid": pid, "t0": now, "c0": {str(k): v for k, v in cur.items()}, "last": None}
+        return None
+    if now - s["t0"] >= CPU_SAMPLE_SECS:
+        used = sum(max(0.0, c - s["c0"].get(str(p), 0.0)) for p, c in cur.items())
+        spawned = any(str(p) not in s["c0"] and p not in IDLE_PIDS for p in cur)   # a build reaps its compilers between samples
+        if spawned or used / (now - s["t0"]) >= CPU_BUSY_SHARE: s["last"] = now
+        s["t0"], s["c0"] = now, {str(k): v for k, v in cur.items()}
+    return s.get("last")
 
 
 def describe(spec):
@@ -52,7 +114,28 @@ def log_detail(path):
     p_ = [a or b for a, b in p_]; f_ = [a or b for a, b in f_]
     if p_:
         out["tests"] = f"{p_[-1]} pass" + (f" · {f_[-1]} fail" if f_ and f_[-1] != "0" else "")
-    if '"step_update"' in text:                                   # agy
+    if '"type":"assistant"' in text:                              # claude -p stream-json (headless managers)
+        # stage only from the manager's own reply text: a worker log it reads back carries the worker's PROGRESS lines
+        out["stage"], out["of"], out["stage_name"] = None, None, ""
+        calls = []
+        for line in text.splitlines():
+            if '"type":"assistant"' not in line:
+                continue
+            try:
+                content = json.loads(line)["message"]["content"]
+            except Exception:
+                continue
+            calls += [c for c in content if c.get("type") == "tool_use"]
+            for c in content:
+                for m in re.finditer(r"PROGRESS (\d+)/(\d+) (?:start|done) ([\w-]+)", c.get("text") or "" if c.get("type") == "text" else ""):
+                    out["stage"], out["of"], out["stage_name"] = int(m.group(1)), int(m.group(2)), m.group(3).replace("-", " ")
+        out["steps"] = len(calls)
+        if calls:
+            name, inp = calls[-1].get("name", ""), calls[-1].get("input") or {}
+            arg = inp.get("description") or inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("prompt") or ""
+            verb = {"Bash": "$", "Read": "read", "Edit": "edit", "Write": "write", "Grep": "search", "Glob": "ls", "Agent": "agent"}.get(name, name)
+            out["doing"] = clean(f"{verb} {str(arg).splitlines()[0] if arg else ''}".replace(H, "~"))
+    elif '"step_update"' in text:                                 # agy
         steps = re.findall(r'"step_index":(\d+)', text)
         out["steps"] = int(steps[-1]) if steps else 0
         for line in reversed(text.splitlines()):
@@ -101,6 +184,10 @@ def main():
     o.dir = os.environ.get("DISPATCH_BAND_DIR") or o.dir   # review-page replays only (set in the capture session's env)
     now = o.now or time.time()
     rows = []
+    kids, cpu = ({}, {}) if os.environ.get("DISPATCH_BAND_DIR") or o.now else process_table()   # replays/tests: log only
+    try: state = json.load(open(ACTIVITY))
+    except Exception: state = {}
+    seen_keys = set()
     for f in sorted(glob.glob(os.path.join(o.dir, "*.json"))):
         try:
             m = json.load(open(f))
@@ -112,6 +199,9 @@ def main():
             continue
         log = m.get("log") or ""
         quiet = int(now - os.path.getmtime(log)) if log and os.path.exists(log) else None
+        key = os.path.basename(f); seen_keys.add(key)
+        busy = last_busy(key, m.get("pid"), now, kids, cpu, state)
+        if busy is not None and quiet is not None: quiet = min(quiet, int(now - busy))
         prof = os.path.basename(m.get("profile") or "")
         rows.append({
             "executor": m.get("executor", "?"),
@@ -126,6 +216,14 @@ def main():
             "what": describe(m.get("spec") or ""),
             **(log_detail(log) if log else {}),
         })
+    if cpu and (state or seen_keys):
+        # keep only live markers' baselines; other sessions' polls share the file, so keep their keys too
+        state = {k: v for k, v in state.items() if k in seen_keys or os.path.exists(os.path.join(o.dir, k))}
+        try:
+            tmp = f"{ACTIVITY}.{os.getpid()}"
+            json.dump(state, open(tmp, "w")); os.replace(tmp, ACTIVITY)
+        except Exception:
+            pass
     rows.sort(key=lambda r: -r["elapsed"])
     rows += waiting(o, now)
     print(json.dumps(rows))
@@ -148,7 +246,7 @@ def waiting(o, now):
         if o.session_pid and q.get("parent_pid") != o.session_pid and not os.environ.get("DISPATCH_BAND_QUEUE_DIR"):
             continue
         out.append({
-            "executor": "codex" if q.get("provider") == "codex" else "agy",
+            "executor": "claude" if q.get("provider") == "claude" else ("codex" if q.get("provider") == "codex" else "agy"),
             "parent_pid": q.get("parent_pid"), "task": q.get("task") or "?", "model": "", "profile": "",
             "elapsed": int(now - float(q.get("created") or now)), "quiet": None, "log_bytes": 0, "session": "", "what": "",
             "waiting": True, "fits_at": q.get("fits_at"), "window": WINDOW.get(q.get("window"), q.get("window") or ""),

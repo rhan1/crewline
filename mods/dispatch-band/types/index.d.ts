@@ -6,6 +6,7 @@ export type Dispatch = {
   stage?: number | null; of?: number | null; stage_name?: string
   doing?: string; files?: number; tests?: string; steps?: number
   waiting?: boolean; fits_at?: number | null; window?: string
+  queued?: boolean; queued_secs?: number; building?: boolean   // optional: a job waiting on / holding a shared resource
 }
 
 declare module 'claude-code' {
