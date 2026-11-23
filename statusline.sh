@@ -134,7 +134,7 @@ make_bar() {
 }
 
 # make_bar_line <week%> <fable% of its own allowance> — the weekly bar, unchanged, plus ONE white line
-# slotted between two cells with a blank column each side; the line's position is Fable usage on a 0-100 %
+# slotted between two cells, in a cell of its own (about half a blank column each side); the line's position is Fable usage on a 0-100 %
 # scale of Fable's own weekly allowance (far left = 0 %, far right = 100 %, 10 % steps).
 make_bar_line() {
   local pct=$1 f=$2 width=10
@@ -145,10 +145,10 @@ make_bar_line() {
   [ "$pct" -gt 0 ] && [ "$te" -eq 0 ] && te=1
   local partials=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
   local color; color=$(pct_color "$pct")
-  # The line is ▕ (the right-hand eighth of a cell) followed by a space: exactly one unpainted cell before the
-  # line and one after it, on the terminal's own background, so the line stands clear of the bar.
+  # The line is │, centred in ONE cell of its own on the terminal's background: the unpainted halves of that
+  # cell leave about half a blank column each side, so the line stands clear of the bar without a thick gap.
   # A partly filled cell also leaves part of itself unpainted (a 1/8 sliver leaves 7/8), which can look like a
-  # second dark column. Set STATUSLINE_TERM_BG to your terminal's background as "r;g;b" (e.g. "11;25;34") and
+  # wider dark gap before the line. Set STATUSLINE_TERM_BG to your terminal's background as "r;g;b" (e.g. "11;25;34") and
   # that cell gets the faint tone an empty cell has (the bar colour at 25 % over that background). Unset =
   # nothing extra is painted, which is safe on any theme.
   local rgb=${color#*38;2;}; rgb=${rgb%m}
@@ -160,7 +160,7 @@ make_bar_line() {
     shade_bg="\033[48;2;$(( tr + (cr - tr) / 4 ));$(( tg + (cg - tg) / 4 ));$(( tb + (cb - tb) / 4 ))m"
   fi
   local k=$(( (f + 5) / 10 ))       # the line sits after cell k (0 = before the first cell)
-  local line="${WHITE}▕ "
+  local line="${WHITE}│"
   local bar="" i lo hi
   [ "$k" -eq 0 ] && bar+="$line"
   for ((i=0; i<width; i++)); do

@@ -309,10 +309,10 @@ Writes `~/.claude/.session-state.json` on every tick (every ~10s). This file is 
 On plans that include Fable, Fable has its own weekly allowance and stops when that is used up, even if the `7d` meter still has room. When that figure is available the weekly meter shows both:
 
 ```
-[███▊░░░▕ ░░░] 7d:38% · fable 70% (5d 14h - 16:00)
+[███▊░░░│░░░] 7d:38% · fable 70% (5d 14h - 16:00)
 ```
 
-The bar and `7d:38%` are the whole week, exactly as before. The white line, with a blank column on each side, is Fable usage on a 0-100% scale of Fable's own allowance (far left = 0%, far right = 100%, in 10% steps), and `fable 70%` is the same number.
+The bar and `7d:38%` are the whole week, exactly as before. The white line, with about half a blank column on each side, is Fable usage on a 0-100% scale of Fable's own allowance (far left = 0%, far right = 100%, in 10% steps), and `fable 70%` is the same number.
 
 Claude Code does not pass this figure to the statusline, so `scripts/fable-usage-refresh.mjs` (installed with the statusline) reads the account usage endpoint that `/usage` uses, at most every 5 minutes, and caches it in `~/.claude/fable-usage.json`. It uses Claude Code's own login token as-is, sends it only to `api.anthropic.com`, and never refreshes or stores it. The endpoint is undocumented: if it changes, or your plan has no Fable allowance, the statusline simply shows its normal 7d meter. To turn it off, delete `~/.claude/scripts/fable-usage-refresh.mjs`. Tests: `bash tests/test-fable-meter.sh`.
 
@@ -324,7 +324,7 @@ Environment variables (set in your shell profile):
 |---|---|---|
 | `CODEX_DISPATCH_CAP_5H` | `50` | Messages-per-5h cap used for the Codex usage bar. ChatGPT Plus is typically 20–100 on GPT-5; pick the midpoint or tune to your actual plan. |
 | `GEMINI_DISPATCH_CAP_5H` | `100` | Same idea for Gemini. Free tier has lower effective caps — tune down if you see the bar peg at 100%. |
-| `STATUSLINE_TERM_BG` | unset | Your terminal's background colour as `r;g;b` (e.g. `11;25;34`). When set, a partly filled cell on the 7d bar is backed with the bar's faint empty tone, so the only dark columns are the two around the Fable line. |
+| `STATUSLINE_TERM_BG` | unset | Your terminal's background colour as `r;g;b` (e.g. `11;25;34`). When set, a partly filled cell on the 7d bar is backed with the bar's faint empty tone, so the only dark space is the half column either side of the Fable line. |
 | `GEMINI_DISPATCH_MODEL` | `gemini-3.1-pro-preview` | The model the Gemini dispatch wrapper forces via `-m`. If you don't have Pro, set this to `gemini-2.0-flash` or another model your account can access. |
 
 To change the statusline colors, the gradient is defined in `pct_color()` near the top — green → yellow → red by default.

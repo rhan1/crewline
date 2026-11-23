@@ -37,20 +37,20 @@ raw1() { printf '%s' "$IN" | COLUMNS=195 FABLE_USAGE_CACHE="$1" bash "$SL" 2>/de
 bar7() { printf '%s' "$1" | sed -E 's/.*\[([^]]*)\] 7d:.*/\1/'; }
 C="$SANDBOX/fable.json"
 cache() { echo "{\"fable_pct\":$1,\"fable_resets_at\":$((NOW+${2:-400000}))}" > "$C"; }
-plain='\[[^]▕ ]{10}\] 7d:37% \([^)]*\)'
+plain='\[[^]│]{10}\] 7d:37% \([^)]*\)'
 
 # Control first: no figure -> the normal 7d meter.
 r=$(row1 "$SANDBOX/none.json"); echo "CONTROL literal: $r"
 { echo "$r" | grep -Eq "$plain" && ! echo "$r" | grep -q fable; } && pass "no figure -> normal 7d meter (10 cells, no line, no Fable text)" || fail "no cache" "$r"
 
 cache 11; r=$(row1 "$C"); echo "GREEN literal:   $r"
-echo "$r" | grep -Eq '\| \[[^]]{12}\] 7d:37% · fable 11% \([^)]*\)' && pass "fresh figure -> one 7d meter reading '7d:37% · fable 11% (clock)'" || fail "merged meter" "$r"
-[ "$(bar7 "$r")" = "█▕ ██▊░░░░░░" ] && pass "weekly fill unchanged (37 % = 3 cells + 3/4); after cell 1 comes the line with one blank column each side" || fail "bar content" "$(bar7 "$r")"
+echo "$r" | grep -Eq '\| \[[^]]{11}\] 7d:37% · fable 11% \([^)]*\)' && pass "fresh figure -> one 7d meter reading '7d:37% · fable 11% (clock)'" || fail "merged meter" "$r"
+[ "$(bar7 "$r")" = "█│██▊░░░░░░" ] && pass "weekly fill unchanged (37 % = 3 cells + 3/4); after cell 1 comes the line in one cell of its own" || fail "bar content" "$(bar7 "$r")"
 echo "$r" | grep -q 'fable 7d:' && fail "separate Fable meter present" "$r" || pass "no separate Fable meter"
 
 for f in 0 4 5 40 70 96 100; do cache "$f"; b=$(bar7 "$(row1 "$C")")
-  k=$(( (f + 5) / 10 )); pre=${b%%▕*}; got=$(printf '%s' "$pre" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
-  lines=$(printf '%s' "$b" | LC_ALL=en_US.UTF-8 grep -o '▕ ' | wc -l | tr -d ' ')
+  k=$(( (f + 5) / 10 )); pre=${b%%│*}; got=$(printf '%s' "$pre" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')
+  lines=$(printf '%s' "$b" | LC_ALL=en_US.UTF-8 grep -o '│' | wc -l | tr -d ' ')
   { [ "$got" = "$k" ] && [ "$lines" = 1 ]; } && pass "Fable $f % -> exactly one line, after cell $k" || fail "line position for $f" "$b"
 done
 
@@ -60,7 +60,7 @@ echo 'not json' > "$C"; r=$(row1 "$C"); { echo "$r" | grep -Eq "$plain" && ! ech
 echo '{"fable_resets_at":'$((NOW+400000))'}' > "$C"; r=$(row1 "$C"); echo "$r" | grep -q fable && fail "cache without a percent shown" "$r" || pass "cache without a percent -> normal 7d meter"
 cache 112; r=$(row1 "$C"); x=$(raw1 "$C")
 { echo "$r" | grep -q '· fable 112%' && printf '%s' "$x" | grep -q $'\x1b\\[1m\x1b\\[[0-9;]*m112%'; } && pass "over the allowance -> real number (112%) in bold" || fail "over 100" "$r"
-cache 64 -60; r=$(row1 "$C"); { echo "$r" | grep -q '· fable 0%' && [ "$(bar7 "$r" | cut -c1-2)" = "▕ " ]; } && pass "past the reset time -> fable 0%, line at the far left" || fail "past reset" "$r"
+cache 64 -60; r=$(row1 "$C"); { echo "$r" | grep -q '· fable 0%' && [ "$(bar7 "$r" | cut -c1)" = "│" ]; } && pass "past the reset time -> fable 0%, line at the far left" || fail "past reset" "$r"
 cache 11; r=$(row1 "$C" "{$BASE}" "$SANDBOX/home2")
 { echo "$r" | grep -q '\] fable 7d:11%' && ! echo "$r" | grep -q '7d:37%'; } && pass "no weekly figure at all -> separate Fable bar as the fallback" || fail "no weekly fallback" "$r"
 
@@ -69,9 +69,11 @@ IN11="{$BASE,\"rate_limits\":{\"five_hour\":{\"used_percentage\":8,\"resets_at\"
 cache 18
 sliver_bg() { printf '%s' "$IN11" | HOME="$SANDBOX/home4" COLUMNS=195 FABLE_USAGE_CACHE="$C" STATUSLINE_TERM_BG="$1" bash "$SL" 2>/dev/null | head -1 | grep -o $'\x1b\\[48;2;[0-9;]*m▏' | wc -l | tr -d ' '; }
 r=$(printf '%s' "$IN11" | HOME="$SANDBOX/home4" COLUMNS=195 FABLE_USAGE_CACHE="$C" bash "$SL" 2>/dev/null | head -1 | strip)
-[ "$(bar7 "$r")" = "█▏▕ ░░░░░░░░" ] && pass "week 11 %, Fable 18 % -> fill, sliver, blank+line, blank, eight empty cells" || fail "bar for 11/18" "$(bar7 "$r")"
+[ "$(bar7 "$r")" = "█▏│░░░░░░░░" ] && pass "week 11 %, Fable 18 % -> fill, sliver, the line cell, eight empty cells" || fail "bar for 11/18" "$(bar7 "$r")"
 [ "$(sliver_bg '')" = 0 ] && pass "STATUSLINE_TERM_BG unset -> nothing extra painted" || fail "background painted without STATUSLINE_TERM_BG"
 [ "$(sliver_bg '11;25;34')" = 1 ] && pass "STATUSLINE_TERM_BG set -> the sliver cell is backed with the faint empty tone" || fail "sliver not backed"
+x=$(printf '%s' "$IN11" | HOME="$SANDBOX/home4" COLUMNS=195 FABLE_USAGE_CACHE="$C" STATUSLINE_TERM_BG="11;25;34" bash "$SL" 2>/dev/null | head -1)
+printf '%s' "$x" | grep -q $'\x1b\\[48;2;[0-9;]*m│' && fail "the line cell carries a background" || pass "the line's own cell is never painted (half a blank column each side)"
 [ "$(sliver_bg 'not-a-colour')" = 0 ] && pass "malformed STATUSLINE_TERM_BG -> ignored" || fail "malformed value painted a background"
 
 # Refresher
