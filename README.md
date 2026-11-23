@@ -304,6 +304,18 @@ Then `/reload-plugins` in open sessions. Toggle with `/dispatches on` / `/dispat
 
 Writes `~/.claude/.session-state.json` on every tick (every ~10s). This file is the ground truth for `/budget-check`, `/execute-at-reset`, and `auto-budget-check.js` — the statusline is the only component that actually sees Claude Code's rate-limit data, so it mirrors it into a file the other components can read.
 
+### Fable weekly allowance (the line on the 7d bar)
+
+On plans that include Fable, Fable has its own weekly allowance and stops when that is used up, even if the `7d` meter still has room. When that figure is available the weekly meter shows both:
+
+```
+[███▊░░░│░░░] 7d:38% · fable 70% (5d 14h - 16:00)
+```
+
+The bar and `7d:38%` are the whole week, exactly as before. The white line is Fable usage on a 0-100% scale of Fable's own allowance (far left = 0%, far right = 100%, in 10% steps), and `fable 70%` is the same number.
+
+Claude Code does not pass this figure to the statusline, so `scripts/fable-usage-refresh.mjs` (installed with the statusline) reads the account usage endpoint that `/usage` uses, at most every 5 minutes, and caches it in `~/.claude/fable-usage.json`. It uses Claude Code's own login token as-is, sends it only to `api.anthropic.com`, and never refreshes or stores it. The endpoint is undocumented: if it changes, or your plan has no Fable allowance, the statusline simply shows its normal 7d meter. To turn it off, delete `~/.claude/scripts/fable-usage-refresh.mjs`. Tests: `bash tests/test-fable-meter.sh`.
+
 ### Customization
 
 Environment variables (set in your shell profile):

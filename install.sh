@@ -112,7 +112,8 @@ COMP_FILES_9="scripts/spawn-executor.sh:scripts/spawn-executor.sh commands/hando
 COMP_COUNT=10
 
 # Statusline files — always installed (no prompt).
-STATUSLINE_FILES="statusline.sh:statusline.sh"
+# fable-usage-refresh.mjs rides with the statusline: it feeds the Fable line on the 7d meter (no-op on plans without Fable).
+STATUSLINE_FILES="statusline.sh:statusline.sh scripts/fable-usage-refresh.mjs:scripts/fable-usage-refresh.mjs"
 
 # ---------------------------------------------------------------------------
 # Prompt helper — asks "Install X? [Y/n]" and sets the answer variable.
@@ -252,7 +253,7 @@ install_files() {
     echo "  ok $rel"
   done
 
-  chmod +x "$CLAUDE_DIR/statusline.sh" "$CLAUDE_DIR/scripts/"*.sh 2>/dev/null || true
+  chmod +x "$CLAUDE_DIR/statusline.sh" "$CLAUDE_DIR/scripts/"*.sh "$CLAUDE_DIR/scripts/"*.mjs 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------

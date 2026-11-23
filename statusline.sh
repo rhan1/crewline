@@ -133,6 +133,31 @@ make_bar() {
   printf "${GRAY}[${color}%s${GRAY}]${RESET}" "$bar"
 }
 
+# make_bar_line <week%> <fable% of its own allowance> — today's weekly bar, unchanged, plus ONE white line
+# slotted between two cells; the line's position is Fable usage on a 0-100 % scale of Fable's own weekly
+# allowance (far left = 0 %, far right = 100 %, 10 % steps).
+make_bar_line() {
+  local pct=$1 f=$2 width=10
+  [ "$f" -lt 0 ] && f=0; [ "$f" -gt 100 ] && f=100
+  local max=$((width * 8)) te
+  te=$(awk "BEGIN{printf \"%d\", ($pct/100)*$max + 0.5}")
+  [ "$te" -lt 0 ] && te=0; [ "$te" -gt "$max" ] && te=$max
+  [ "$pct" -gt 0 ] && [ "$te" -eq 0 ] && te=1
+  local partials=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
+  local color; color=$(pct_color "$pct")
+  local k=$(( (f + 5) / 10 ))       # the line sits after cell k (0 = before the first cell)
+  local bar="" i lo hi
+  [ "$k" -eq 0 ] && bar+="${WHITE}│"
+  for ((i=0; i<width; i++)); do
+    lo=$((i * 8)); hi=$((lo + 8))
+    if   [ "$te" -ge "$hi" ]; then bar+="${color}█"
+    elif [ "$te" -gt "$lo" ]; then bar+="${color}${partials[$((te - lo))]}"
+    else bar+="${color}░"; fi
+    [ $((i + 1)) -eq "$k" ] && bar+="${WHITE}│"
+  done
+  printf '%b' "${GRAY}[${bar}${GRAY}]${RESET}"
+}
+
 # Format time until a reset target as e.g. "1h 49m". Accepts either a Unix
 # epoch integer (what Claude Code sends via stdin) or an ISO-8601 string.
 # Optional 2nd arg: window seconds. If the target is in the past, advance
@@ -403,6 +428,49 @@ else
   seven_part=""
 fi
 
+# ── Fable weekly allowance, shown ON the 7d meter ────────────────────────────
+# On plans with Fable, Fable has its own weekly allowance (a share of the week) and stops when THAT is full,
+# even while 7d still looks half empty. stdin does not carry it, so scripts/fable-usage-refresh.mjs reads the
+# same account usage endpoint /usage does and caches it in ~/.claude/fable-usage.json; this block kicks that
+# refresher when the cache is over 5 min old (one attempt per 2 min) and ignores a cache over 30 min old — a
+# stale number is worse than none.
+# With a fresh figure the weekly bar keeps its colours and gains one white line at Fable's usage
+# (make_bar_line), and the text reads `7d:N% · fable N% (reset clock)`. No figure (no Fable on the plan, or
+# the refresher is not installed) -> the normal 7d meter, untouched. The separate `[bar] fable 7d:N%` meter is
+# only the fallback for the rare case where the weekly figure itself is missing.
+fable_part=""
+fable_cache="${FABLE_USAGE_CACHE:-$HOME/.claude/fable-usage.json}"   # env override: tests only
+fable_refresh="$HOME/.claude/scripts/fable-usage-refresh.mjs"
+_fa_now=$(date +%s); _fa_m=0
+[ -f "$fable_cache" ] && _fa_m=$(stat -f %m "$fable_cache" 2>/dev/null)
+[[ "$_fa_m" =~ ^[0-9]+$ ]] || _fa_m=0
+if [ $((_fa_now - _fa_m)) -ge 300 ] && [ -x "$fable_refresh" ]; then
+  _fa_a=$(stat -f %m "$fable_cache.attempt" 2>/dev/null); [[ "$_fa_a" =~ ^[0-9]+$ ]] || _fa_a=0
+  if [ $((_fa_now - _fa_a)) -ge 120 ]; then
+    : > "$fable_cache.attempt" 2>/dev/null
+    nohup "$fable_refresh" </dev/null >/dev/null 2>&1 &
+  fi
+fi
+if [ "$_fa_m" -gt 0 ] && [ $((_fa_now - _fa_m)) -lt 1800 ]; then
+  IFS='|' read -r fable_pct fable_reset <<< "$(jq -r '"\(.fable_pct // "")|\(.fable_resets_at // "")"' "$fable_cache" 2>/dev/null)"
+  fable_int=$(printf '%.0f' "$fable_pct" 2>/dev/null)
+  if [ -n "$fable_pct" ] && [[ "$fable_int" =~ ^[0-9]+$ ]]; then
+    [[ "$fable_reset" =~ ^[0-9]+$ ]] && [ "$_fa_now" -ge "$fable_reset" ] && fable_int=0
+    if [ "$fable_int" -ge 100 ]; then
+      fable_bar=$(make_bar 100 10); fable_color="${BOLD}${RED}"
+    else
+      fable_bar=$(make_bar "$fable_int" 10); fable_color=$(pct_color "$fable_int")
+    fi
+    if [ -n "$seven_part" ]; then
+      _f7_clock=""
+      [ -n "${seven_eta:-}" ] && _f7_clock=" ${DIM}(${seven_eta}${seven_clock:+ - ${seven_clock}})${RESET}"
+      seven_part="$(make_bar_line "$seven_int" "$fable_int") ${DIM}7d:${RESET}${seven_color}${seven_int}%${RESET}${DIM} \xc2\xb7 fable ${RESET}${fable_color}${fable_int}%${RESET}${_f7_clock}"
+    else
+      fable_part="${fable_bar} ${DIM}fable 7d:${RESET}${fable_color}${fable_int}%${RESET}"
+    fi
+  fi
+fi
+
 # ── Cache hit % + savings $ ──────────────────────────────────────────────────
 cache_read=$(echo "$input" | jq -r '
   .context_window.cache_read_tokens //
@@ -526,6 +594,7 @@ out="${model_part}"
 out="${out}${SEP}${ctx_part}"
 [ -n "$five_part" ]  && out="${out}${SEP}${five_part}"
 [ -n "$seven_part" ] && out="${out}${SEP}${seven_part}"
+[ -n "$fable_part" ] && out="${out}${SEP}${fable_part}"
 [ -n "$cache_part" ] && out="${out}${SEP}${cache_part}"
 out="${out}${SEP}${cost_part}"
 [ -n "$cp_main_part" ] && out="${out}${SEP}${cp_main_part}"
