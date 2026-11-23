@@ -133,9 +133,9 @@ make_bar() {
   printf "${GRAY}[${color}%s${GRAY}]${RESET}" "$bar"
 }
 
-# make_bar_line <week%> <fable% of its own allowance> — today's weekly bar, unchanged, plus ONE white line
-# slotted between two cells; the line's position is Fable usage on a 0-100 % scale of Fable's own weekly
-# allowance (far left = 0 %, far right = 100 %, 10 % steps).
+# make_bar_line <week%> <fable% of its own allowance> — the weekly bar, unchanged, plus ONE white line
+# slotted between two cells with a blank column each side; the line's position is Fable usage on a 0-100 %
+# scale of Fable's own weekly allowance (far left = 0 %, far right = 100 %, 10 % steps).
 make_bar_line() {
   local pct=$1 f=$2 width=10
   [ "$f" -lt 0 ] && f=0; [ "$f" -gt 100 ] && f=100
@@ -145,15 +145,30 @@ make_bar_line() {
   [ "$pct" -gt 0 ] && [ "$te" -eq 0 ] && te=1
   local partials=("" "▏" "▎" "▍" "▌" "▋" "▊" "▉")
   local color; color=$(pct_color "$pct")
+  # The line is ▕ (the right-hand eighth of a cell) followed by a space: exactly one unpainted cell before the
+  # line and one after it, on the terminal's own background, so the line stands clear of the bar.
+  # A partly filled cell also leaves part of itself unpainted (a 1/8 sliver leaves 7/8), which can look like a
+  # second dark column. Set STATUSLINE_TERM_BG to your terminal's background as "r;g;b" (e.g. "11;25;34") and
+  # that cell gets the faint tone an empty cell has (the bar colour at 25 % over that background). Unset =
+  # nothing extra is painted, which is safe on any theme.
+  local rgb=${color#*38;2;}; rgb=${rgb%m}
+  local cr cg cb tr tg tb
+  IFS=';' read -r cr cg cb <<< "$rgb"; IFS=';' read -r tr tg tb <<< "${STATUSLINE_TERM_BG:-}"
+  local shade_bg=""
+  local _v _ok=1; for _v in "$cr" "$cg" "$cb" "$tr" "$tg" "$tb"; do [[ "$_v" =~ ^[0-9]+$ ]] || _ok=0; done   # all six, each a number
+  if [ "$_ok" = 1 ]; then
+    shade_bg="\033[48;2;$(( tr + (cr - tr) / 4 ));$(( tg + (cg - tg) / 4 ));$(( tb + (cb - tb) / 4 ))m"
+  fi
   local k=$(( (f + 5) / 10 ))       # the line sits after cell k (0 = before the first cell)
+  local line="${WHITE}▕ "
   local bar="" i lo hi
-  [ "$k" -eq 0 ] && bar+="${WHITE}│"
+  [ "$k" -eq 0 ] && bar+="$line"
   for ((i=0; i<width; i++)); do
     lo=$((i * 8)); hi=$((lo + 8))
     if   [ "$te" -ge "$hi" ]; then bar+="${color}█"
-    elif [ "$te" -gt "$lo" ]; then bar+="${color}${partials[$((te - lo))]}"
+    elif [ "$te" -gt "$lo" ]; then bar+="${color}${shade_bg}${partials[$((te - lo))]}\033[49m"
     else bar+="${color}░"; fi
-    [ $((i + 1)) -eq "$k" ] && bar+="${WHITE}│"
+    [ $((i + 1)) -eq "$k" ] && bar+="$line"
   done
   printf '%b' "${GRAY}[${bar}${GRAY}]${RESET}"
 }
